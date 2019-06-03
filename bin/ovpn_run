@@ -58,6 +58,8 @@ if [ ! -f "$EASYRSA_PKI/issued/${DOMAIN_NAME:-vpn.server.address}.crt" ]; then
     ovpn_initpki nopass
 fi
 
+mkdir -p $OPENVPN/clients
+
 # Creating users
 for USER in $(echo ${USERS:-} | sed "s/,/ /g")
 do
@@ -68,19 +70,27 @@ do
     fi
     echo "Not found, creating..."
     easyrsa build-client-full $USER nopass
+    ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
 done
 
 # Revoking users
 for REVOKE_USER in $(echo ${REVOKE_USERS:-} | sed "s/,/ /g")
 do
-    echo -n "--> Checking $REVOKE_USER... "
+    echo -n "--> Checking for revoke $REVOKE_USER... "
     if [ ! -f "$EASYRSA_PKI/private/$REVOKE_USER.key" ]; then
         echo "Doesnt exist, skipping revoke"
         continue
     fi
     echo "Found, revoking..."
     ovpn_revokeclient $REVOKE_USER remove
+    mv $OPENVPN/clients/$USER.ovpn $OPENVPN/clients/$USER-REVOKED.ovpn
 done
+
+if [ -z "${S3_BUCKET:-}" ]; then
+    # Syncing ovpn files to S3
+    echo "--> Syncing ovpn client files to S3"
+    aws s3 sync $OPENVPN/clients/ s3://${S3_BUCKET} --delete
+fi
 
 addArg "--config" "$OPENVPN/openvpn.conf"
 
