@@ -11,6 +11,14 @@ RUN echo "http://dl-cdn.alpinelinux.org/alpine/edge/testing/" >> /etc/apk/reposi
     ln -s /usr/share/easy-rsa/easyrsa /usr/local/bin && \
     rm -rf /tmp/* /var/tmp/* /var/cache/apk/* /var/cache/distfiles/*
 
+ENV AWSCLI_VERSION=1.16.169
+
+RUN apk --no-cache update && \
+    apk --no-cache add python py-pip py-setuptools ca-certificates groff less bash make jq gettext-dev curl wget g++ zip git && \
+    pip --no-cache-dir install awscli==$AWSCLI_VERSION && \
+    update-ca-certificates && \
+    rm -rf /var/cache/apk/*
+
 # Needed by scripts
 ENV OPENVPN /etc/openvpn
 ENV EASYRSA /usr/share/easy-rsa
