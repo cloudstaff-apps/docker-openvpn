@@ -86,7 +86,7 @@ do
     mv $OPENVPN/clients/$USER.ovpn $OPENVPN/clients/$USER-REVOKED.ovpn
 done
 
-if [ -z "${S3_BUCKET:-}" ]; then
+if [ ! -z "${S3_BUCKET:-}" ]; then
     # Syncing ovpn files to S3
     echo "--> Syncing ovpn client files to S3"
     aws s3 sync $OPENVPN/clients/ s3://${S3_BUCKET} --delete
