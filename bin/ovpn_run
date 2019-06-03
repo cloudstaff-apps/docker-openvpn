@@ -49,13 +49,12 @@ function setupIptablesAndRouting {
     done
 }
 
-# Generate config
-if [ ! -f "$OPENVPN/openvpn.conf" ]; then
+# Generate config and init PKI
+if [ ! -f "$EASYRSA_PKI/issued/${DOMAIN_NAME:-vpn.server.address}.crt" ]; then
+    if [ -d "$EASYRSA_PKI" ]; then
+        mv $EASYRSA_PKI $EASYRSA_PKI.$(date "+%s").bak
+    fi
     ovpn_genconfig -u udp://${DOMAIN_NAME:-vpn.server.address}
-fi
-
-# Init PKI
-if [ ! -f "$EASYRSA_PKI/ta.key" ]; then
     ovpn_initpki nopass
 fi
 
