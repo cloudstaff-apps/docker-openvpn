@@ -49,62 +49,74 @@ function setupIptablesAndRouting {
     done
 }
 
-# Generate config and init PKI
-if [ ! -f "$EASYRSA_PKI/issued/${DOMAIN_NAME:-vpn.server.address}.crt" ]; then
-    if [ -d "$EASYRSA_PKI" ]; then
-        mv $EASYRSA_PKI $EASYRSA_PKI.$(date "+%s").bak
+function checkUpdateConfig {
+    echo "--> Chcecking Config..."
+
+    USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /openvpn/USERS --output text --query 'Parameter.Value')
+    ROUTE_PUSH=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /openvpn/ROUTE_PUSH --output text --query 'Parameter.Value')
+    REVOKE_USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /openvpn/REVOKE_USERS --output text --query 'Parameter.Value')
+
+    # Generate config and init PKI
+    if [ ! -f "$EASYRSA_PKI/issued/${DOMAIN_NAME:-vpn.server.address}.crt" ]; then
+        echo "--> Domain certificate not found, recreating PKI..."
+        if [ -d "$EASYRSA_PKI" ]; then
+            mv $EASYRSA_PKI $EASYRSA_PKI.$(date "+%s").bak
+        fi
+
+        ROUTE_PUSH_ARG=""
+        if [ ! -z "${ROUTE_PUSH:-}" ]; then
+            echo "--> Adding routes: ${ROUTE_PUSH}"
+            IFS="," read -ra ROUTES <<< "${ROUTE_PUSH:-}"
+            for ROUTE in "${ROUTES[@]}"; do
+                ROUTE_PUSH_ARGS+=('-p' "route ${ROUTE}")
+            done
+        fi
+
+        ovpn_genconfig -u udp://${DOMAIN_NAME:-vpn.server.address} -d -N "${ROUTE_PUSH_ARGS[@]}"
+        echo "--> /etc/openvpn/openvpn.conf START"
+        cat /etc/openvpn/openvpn.conf
+        echo "--> /etc/openvpn/openvpn.conf END"
+        ovpn_initpki nopass
     fi
 
-    ROUTE_PUSH_ARG=""
-    if [ ! -z "${ROUTE_PUSH:-}" ]; then
-        echo "--> Adding routes: ${ROUTE_PUSH}"
-        IFS="," read -ra ROUTES <<< "${ROUTE_PUSH:-}"
-        for ROUTE in "${ROUTES[@]}"; do
-            ROUTE_PUSH_ARGS+=('-p' "route ${ROUTE}")
-        done
+    mkdir -p $OPENVPN/clients
+
+    # Creating users
+    for USER in $(echo ${USERS:-} | sed "s/,/ /g")
+    do
+        echo -n "--> Checking $USER... "
+        if [ -f "$EASYRSA_PKI/private/$USER.key" ]; then
+            echo "Found"
+            continue
+        fi
+        echo "    Not found, creating..."
+        easyrsa build-client-full $USER nopass
+
+        ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
+    done
+
+    # Revoking users
+    for REVOKE_USER in $(echo ${REVOKE_USERS:-} | sed "s/,/ /g")
+    do
+        echo -n "--> Checking for revoke $REVOKE_USER... "
+        if [ ! -f "$EASYRSA_PKI/private/$REVOKE_USER.key" ]; then
+            echo "Doesnt exist, skipping revoke"
+            continue
+        fi
+        echo "    Found, revoking..."
+        ovpn_revokeclient $REVOKE_USER remove
+        mv $OPENVPN/clients/$USER.ovpn $OPENVPN/clients/$USER-REVOKED.ovpn
+    done
+
+    if [ ! -z "${S3_BUCKET:-}" ]; then
+        # Syncing ovpn files to S3
+        echo "--> Syncing ovpn client files to S3"
+        aws s3 sync $OPENVPN/clients/ s3://${S3_BUCKET} --delete
     fi
 
-    ovpn_genconfig -u udp://${DOMAIN_NAME:-vpn.server.address} -d -N "${ROUTE_PUSH_ARGS[@]}"
-    echo "--> /etc/openvpn/openvpn.conf START"
-    cat /etc/openvpn/openvpn.conf
-    echo "--> /etc/openvpn/openvpn.conf END"
-    ovpn_initpki nopass
-fi
+}
 
-mkdir -p $OPENVPN/clients
-
-# Creating users
-for USER in $(echo ${USERS:-} | sed "s/,/ /g")
-do
-    echo -n "--> Checking $USER... "
-    if [ -f "$EASYRSA_PKI/private/$USER.key" ]; then
-        echo "Found"
-        continue
-    fi
-    echo "Not found, creating..."
-    easyrsa build-client-full $USER nopass
-
-    ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
-done
-
-# Revoking users
-for REVOKE_USER in $(echo ${REVOKE_USERS:-} | sed "s/,/ /g")
-do
-    echo -n "--> Checking for revoke $REVOKE_USER... "
-    if [ ! -f "$EASYRSA_PKI/private/$REVOKE_USER.key" ]; then
-        echo "Doesnt exist, skipping revoke"
-        continue
-    fi
-    echo "Found, revoking..."
-    ovpn_revokeclient $REVOKE_USER remove
-    mv $OPENVPN/clients/$USER.ovpn $OPENVPN/clients/$USER-REVOKED.ovpn
-done
-
-if [ ! -z "${S3_BUCKET:-}" ]; then
-    # Syncing ovpn files to S3
-    echo "--> Syncing ovpn client files to S3"
-    aws s3 sync $OPENVPN/clients/ s3://${S3_BUCKET} --delete
-fi
+checkUpdateConfig
 
 addArg "--config" "$OPENVPN/openvpn.conf"
 
@@ -151,6 +163,15 @@ if [ $? = 0 ]; then
     sysctl -w net.ipv6.conf.default.forwarding=1 || echo "Failed to enable IPv6 Forwarding default"
     sysctl -w net.ipv6.conf.all.forwarding=1 || echo "Failed to enable IPv6 Forwarding"
 fi
+
+function loopCheckUpdateConfig {
+    while true; do
+        checkUpdateConfig &
+        sleep 60
+    done
+}
+
+loopCheckUpdateConfig &
 
 echo "Running 'openvpn ${ARGS[@]} ${USER_ARGS[@]}'"
 exec openvpn ${ARGS[@]} ${USER_ARGS[@]}
