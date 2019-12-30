@@ -50,11 +50,17 @@ function setupIptablesAndRouting {
 }
 
 function checkUpdateConfig {
-    echo "--> Chcecking Config..."
+    echo "--> Checking Config..."
 
-    USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /openvpn/USERS --output text --query 'Parameter.Value')
-    ROUTE_PUSH=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /openvpn/ROUTE_PUSH --output text --query 'Parameter.Value')
-    REVOKE_USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /openvpn/REVOKE_USERS --output text --query 'Parameter.Value')
+    if [ ! -n "${USERS}" ]; then
+        USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /openvpn/USERS --output text --query 'Parameter.Value')
+    fi
+    if [ ! -n "${ROUTE_PUSH}" ]; then
+        ROUTE_PUSH=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /openvpn/ROUTE_PUSH --output text --query 'Parameter.Value')
+    fi
+    if [ ! -n "${REVOKE_USERS}" ]; then
+        REVOKE_USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /openvpn/REVOKE_USERS --output text --query 'Parameter.Value')
+    fi
 
     # Generate config and init PKI
     if [ ! -f "$EASYRSA_PKI/issued/${DOMAIN_NAME:-vpn.server.address}.crt" ]; then

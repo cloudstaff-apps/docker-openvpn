@@ -36,5 +36,6 @@ docker build -t kylemanna/openvpn:latest .
 Testing:
 
 ```
-docker run -v $OVPN_DATA:/etc/openvpn -e "DOMAIN_NAME=vpn3.server.address" -e "USERS=user1" -e "REVOKE_USERS=allan" -e "ROUTE_PUSH=\"10.100.0.0 255.255.0.0,10.200.0.0 255.255.0.0\"" -p 1194:1194/udp --cap-add=NET_ADMIN kylemanna/openvpn
+mkdir -p storage
+docker run -v $(PWD)/storage:/etc/openvpn -e "DOMAIN_NAME=vpn3.server.address" -e "USERS=user1,user2 " -e "REVOKE_USERS=allan" -e "ROUTE_PUSH=10.100.0.0 255.255.0.0,10.200.0.0 255.255.0.0" -p 1194:1194/udp --cap-add=NET_ADMIN kylemanna/openvpn
 ```
