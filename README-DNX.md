@@ -37,5 +37,5 @@ Testing:
 
 ```
 mkdir -p storage
-docker run -v $(PWD)/storage:/etc/openvpn -e "DOMAIN_NAME=vpn3.server.address" -e "USERS=user1,user2 " -e "REVOKE_USERS=allan" -e "ROUTE_PUSH=10.100.0.0 255.255.0.0,10.200.0.0 255.255.0.0" -p 1194:1194/udp --cap-add=NET_ADMIN kylemanna/openvpn
+docker run -v $(PWD)/storage:/etc/openvpn --env-file=.env.assume -e "MFA=true" -e "AWS_DEFAULT_REGION=ap-southeast-2" -e "NAME=openvpn-mgmt" -e "DOMAIN_NAME=vpn3.server.address" -e "ROUTE_PUSH=10.100.0.0 255.255.0.0,10.200.0.0 255.255.0.0" -p 1194:1194/udp --cap-add=NET_ADMIN kylemanna/openvpn
 ```

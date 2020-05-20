@@ -15,6 +15,7 @@ cd $OPENVPN
 # Build runtime arguments array based on environment
 USER_ARGS=("${@}")
 ARGS=()
+CIPHER=AES-256-OFB
 
 # Checks if ARGS already contains the given value
 function hasArg {
@@ -58,21 +59,27 @@ function checkUpdateConfig {
 
     # Generate config and init PKI
     if [ ! -f "$EASYRSA_PKI/issued/${DOMAIN_NAME:-vpn.server.address}.crt" ]; then
-        echo "--> Domain certificate not found, recreating PKI..."
+        echo "==> Domain certificate not found, recreating PKI..."
         if [ -d "$EASYRSA_PKI" ]; then
             mv $EASYRSA_PKI $EASYRSA_PKI.$(date "+%s").bak
         fi
 
         ROUTE_PUSH_ARG=""
         if [ ! -z "${ROUTE_PUSH:-}" ]; then
-            echo "--> Adding routes: ${ROUTE_PUSH}"
+            echo "==> Adding routes: ${ROUTE_PUSH}"
             IFS="," read -ra ROUTES <<< "${ROUTE_PUSH:-}"
             for ROUTE in "${ROUTES[@]}"; do
                 ROUTE_PUSH_ARGS+=('-p' "route ${ROUTE}")
             done
         fi
 
-        ovpn_genconfig -u udp://${DOMAIN_NAME:-vpn.server.address} -d -N "${ROUTE_PUSH_ARGS[@]}"
+        echo "==> Generating openvpn config"
+        if [ "${MFA:-false}" == "true" ]; then
+            echo "--> MFA Enabled"
+            ovpn_genconfig -u udp://${DOMAIN_NAME:-vpn.server.address} -d -N "${ROUTE_PUSH_ARGS[@]}" -2 -C ${CIPHER}
+        else
+            ovpn_genconfig -u udp://${DOMAIN_NAME:-vpn.server.address} -d -N "${ROUTE_PUSH_ARGS[@]}"
+        fi
         echo "--> /etc/openvpn/openvpn.conf START"
         cat /etc/openvpn/openvpn.conf
         echo "--> /etc/openvpn/openvpn.conf END"
@@ -89,8 +96,13 @@ function checkUpdateConfig {
             echo "Found"
             continue
         fi
-        echo "    Not found, creating..."
+        echo "NOT found"
+        echo "==> Creating user: $USER..."
         easyrsa build-client-full $USER nopass
+        if [ "${MFA:-false}" == "true" ]; then
+            echo "    MFA enabled, setting OTP"
+            ovpn_otp_user $USER > $OPENVPN/clients/$USER.mfa
+        fi
 
         ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
     done
@@ -103,9 +115,13 @@ function checkUpdateConfig {
             echo "Doesnt exist, skipping revoke"
             continue
         fi
-        echo "    Found, revoking..."
+        echo "Found"
+        echo "==> Revoking user: $USER..."
         ovpn_revokeclient $REVOKE_USER remove
         mv $OPENVPN/clients/$USER.ovpn $OPENVPN/clients/$USER-REVOKED.ovpn
+        if [ "${MFA:-false}" == "true" ]; then
+            mv $OPENVPN/clients/$USER.mfa $OPENVPN/clients/$USER-REVOKED.mfa
+        fi
     done
 
     if [ ! -z "${S3_BUCKET:-}" ]; then
