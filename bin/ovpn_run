@@ -96,32 +96,54 @@ function checkUpdateConfig {
             echo "Found"
             continue
         fi
-        echo "NOT found"
-        echo "==> Creating user: $USER..."
-        easyrsa build-client-full $USER nopass
-        if [ "${MFA:-false}" == "true" ]; then
-            echo "    MFA enabled, setting OTP"
-            ovpn_otp_user $USER > $OPENVPN/clients/$USER.mfa
-        fi
-
-        ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
+		if [ "${REVOKE_USERS}" == "," ]; then
+		    echo "Revoke is empty"
+            echo "==> Creating user: $USER..."
+	        easyrsa build-client-full $USER nopass
+			ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
+            if [ "${MFA:-false}" == "true" ]; then
+                echo "    MFA enabled, setting OTP"
+                ovpn_otp_user $USER > $OPENVPN/clients/$USER.mfa
+            fi
+		else
+            for REVOKE_USER in $(echo $REVOKE_USERS | sed "s/,/ /g")
+            do
+                if [ "${USER}" == "${REVOKE_USER}" ]; then
+                    echo -n "--> Skipping $USER creation... User to be revoked"
+		    	else
+		    	    echo "NOT found"
+                    echo "==> Creating user: $USER..."
+	                easyrsa build-client-full $USER nopass
+                    ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
+                    if [ "${MFA:-false}" == "true" ]; then
+                        echo "    MFA enabled, setting OTP"
+                        ovpn_otp_user $USER > $OPENVPN/clients/$USER.mfa
+                    fi
+                fi
+            done
+		fi
     done
 
     # Revoking users
     for REVOKE_USER in $(echo ${REVOKE_USERS:-} | sed "s/,/ /g")
     do
-        echo -n "--> Checking for revoke $REVOKE_USER... "
-        if [ ! -f "$EASYRSA_PKI/private/$REVOKE_USER.key" ]; then
+        echo -n "--> Checking to revoke $REVOKE_USER... "
+        if [ ! -f "$EASYRSA_PKI/private/${REVOKE_USER}.key" ]; then
             echo "Doesnt exist, skipping revoke"
             continue
         fi
-        echo "Found"
-        echo "==> Revoking user: $USER..."
-        ovpn_revokeclient $REVOKE_USER remove
-        mv $OPENVPN/clients/$USER.ovpn $OPENVPN/clients/$USER-REVOKED.ovpn
-        if [ "${MFA:-false}" == "true" ]; then
-            mv $OPENVPN/clients/$USER.mfa $OPENVPN/clients/$USER-REVOKED.mfa
-        fi
+		if [ -f $OPENVPN/clients/${REVOKE_USER}-REVOKED.ovpn ]; then
+		    echo "User already revoked, skipping..."
+			continue
+		else
+		    echo "Found"
+            echo "==> Revoking user: ${REVOKE_USER}..."
+            ovpn_revokeclient $REVOKE_USER remove
+            mv $OPENVPN/clients/${REVOKE_USER}.ovpn $OPENVPN/clients/${REVOKE_USER}-REVOKED.ovpn
+            if [ "${MFA:-false}" == "true" ]; then
+                mv $OPENVPN/clients/${REVOKE_USER}.mfa $OPENVPN/clients/${REVOKE_USER}-REVOKED.mfa
+            fi
+		fi
     done
 
     if [ ! -z "${S3_BUCKET:-}" ]; then
