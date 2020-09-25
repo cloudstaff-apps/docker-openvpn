@@ -15,7 +15,7 @@ cd $OPENVPN
 # Build runtime arguments array based on environment
 USER_ARGS=("${@}")
 ARGS=()
-CIPHER=AES-256-OFB
+CIPHER=AES-256-GCM
 
 # Checks if ARGS already contains the given value
 function hasArg {
