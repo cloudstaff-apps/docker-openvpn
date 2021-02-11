@@ -7,7 +7,7 @@ LABEL maintainer="Kyle Manna <kyle@kylemanna.com>"
 
 # Testing: pamtester
 RUN echo "http://dl-cdn.alpinelinux.org/alpine/edge/testing/" >> /etc/apk/repositories && \
-    apk add --update openvpn iptables bash easy-rsa=3.0.5-r0 openvpn-auth-pam google-authenticator pamtester && \
+    apk add --update openvpn iptables bash easy-rsa=3.0.5-r0 openvpn-auth-pam google-authenticator pamtester python3 && \
     ln -s /usr/share/easy-rsa/easyrsa /usr/local/bin && \
     rm -rf /tmp/* /var/tmp/* /var/cache/apk/* /var/cache/distfiles/*
 
@@ -32,6 +32,7 @@ VOLUME ["/etc/openvpn"]
 
 # Internally uses port 1194/udp, remap using `docker run -p 443:1194/tcp`
 EXPOSE 1194/udp
+EXPOSE 8080/tcp
 
 CMD ["ovpn_run"]
 

@@ -211,5 +211,8 @@ function loopCheckUpdateConfig {
 
 loopCheckUpdateConfig &
 
+echo "Running http server"
+exec python3 http-server.py &
+
 echo "Running 'openvpn ${ARGS[@]} ${USER_ARGS[@]}'"
 exec openvpn ${ARGS[@]} ${USER_ARGS[@]}
