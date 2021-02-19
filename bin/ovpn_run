@@ -17,6 +17,10 @@ USER_ARGS=("${@}")
 ARGS=()
 CIPHER=AES-256-GCM
 
+set +u
+
+[ -z "$OVPN_PROTO" ] && OVPN_PROTO=udp
+
 # Checks if ARGS already contains the given value
 function hasArg {
     local element
@@ -76,9 +80,9 @@ function checkUpdateConfig {
         echo "==> Generating openvpn config"
         if [ "${MFA:-false}" == "true" ]; then
             echo "--> MFA Enabled"
-            ovpn_genconfig -u udp://${DOMAIN_NAME:-vpn.server.address} -d -N "${ROUTE_PUSH_ARGS[@]}" -2 -C ${CIPHER}
+            ovpn_genconfig -u ${OVPN_PROTO}://${DOMAIN_NAME:-vpn.server.address} -d -N "${ROUTE_PUSH_ARGS[@]}" -2 -C ${CIPHER}
         else
-            ovpn_genconfig -u udp://${DOMAIN_NAME:-vpn.server.address} -d -N "${ROUTE_PUSH_ARGS[@]}"
+            ovpn_genconfig -u ${OVPN_PROTO}://${DOMAIN_NAME:-vpn.server.address} -d -N "${ROUTE_PUSH_ARGS[@]}"
         fi
         echo "--> /etc/openvpn/openvpn.conf START"
         cat /etc/openvpn/openvpn.conf
@@ -210,9 +214,6 @@ function loopCheckUpdateConfig {
 }
 
 loopCheckUpdateConfig &
-
-echo "Running http server"
-exec python3 http-server.py &
 
 echo "Running 'openvpn ${ARGS[@]} ${USER_ARGS[@]}'"
 exec openvpn ${ARGS[@]} ${USER_ARGS[@]}
