@@ -6,10 +6,15 @@ FROM alpine:3.9
 LABEL maintainer="Kyle Manna <kyle@kylemanna.com>"
 
 # Testing: pamtester
-RUN echo "http://dl-cdn.alpinelinux.org/alpine/edge/testing/" >> /etc/apk/repositories && \
-    apk add --update openvpn iptables bash easy-rsa=3.0.5-r0 openvpn-auth-pam google-authenticator pamtester python3 && \
+RUN apk add --update openvpn iptables bash easy-rsa=3.0.5-r0 openvpn-auth-pam google-authenticator python3 && \
     ln -s /usr/share/easy-rsa/easyrsa /usr/local/bin && \
     rm -rf /tmp/* /var/tmp/* /var/cache/apk/* /var/cache/distfiles/*
+
+RUN apk add \
+  --no-cache \
+  --allow-untrusted \
+  --repository http://dl-cdn.alpinelinux.org/alpine/edge/testing \
+  pamtester 
 
 ENV AWSCLI_VERSION=1.16.169
 

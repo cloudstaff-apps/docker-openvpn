@@ -1,0 +1,28 @@
+version: '3'
+services:
+  openvpn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    cap_add:
+     - NET_ADMIN
+    image: cloudstaff/docker-openvpn:latest
+    environment:
+      NAME: external-openvpn-perth
+      DOMAIN_NAME: vpn-perth.shared.cloud.cloudstaff.com
+      S3_BUCKET: external-openvpn-us-west-2/vpn-perth
+      AWS_DEFAULT_REGION: us-west-2
+      MFA: true
+      OVPN_PROTO: tcp
+    env_file:
+      - .aws-keys
+    container_name: openvpn
+    ports:
+     - "1194:1194/tcp"
+    restart: unless-stopped
+    volumes:
+      - ovpn-data-conf:/etc/openvpn
+
+volumes:
+  ovpn-data-conf:   
+    driver: local

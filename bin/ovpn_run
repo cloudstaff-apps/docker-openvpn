@@ -58,7 +58,6 @@ function checkUpdateConfig {
     echo "--> Checking Config..."
 
     USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /${NAME:-openvpn}/USERS --output text --query 'Parameter.Value')
-    ROUTE_PUSH=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /${NAME:-openvpn}/ROUTE_PUSH --output text --query 'Parameter.Value')
     REVOKE_USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /${NAME:-openvpn}/REVOKE_USERS --output text --query 'Parameter.Value')
 
     # Generate config and init PKI
@@ -68,22 +67,14 @@ function checkUpdateConfig {
             mv $EASYRSA_PKI $EASYRSA_PKI.$(date "+%s").bak
         fi
 
-        ROUTE_PUSH_ARG=""
-        if [ ! -z "${ROUTE_PUSH:-}" ]; then
-            echo "==> Adding routes: ${ROUTE_PUSH}"
-            IFS="," read -ra ROUTES <<< "${ROUTE_PUSH:-}"
-            for ROUTE in "${ROUTES[@]}"; do
-                ROUTE_PUSH_ARGS+=('-p' "route ${ROUTE}")
-            done
-        fi
-
-        echo "==> Generating openvpn config"
+        echo "==> Generating openvpn config"   
         if [ "${MFA:-false}" == "true" ]; then
             echo "--> MFA Enabled"
-            ovpn_genconfig -u ${OVPN_PROTO}://${DOMAIN_NAME:-vpn.server.address} -d -N "${ROUTE_PUSH_ARGS[@]}" -2 -C ${CIPHER}
+            ovpn_genconfig -u ${OVPN_PROTO}://${DOMAIN_NAME:-vpn.server.address} -p "redirect-gateway def1" -2 -C ${CIPHER}
         else
-            ovpn_genconfig -u ${OVPN_PROTO}://${DOMAIN_NAME:-vpn.server.address} -d -N "${ROUTE_PUSH_ARGS[@]}"
+            ovpn_genconfig -u ${OVPN_PROTO}://${DOMAIN_NAME:-vpn.server.address} -p "redirect-gateway def1"
         fi
+
         echo "--> /etc/openvpn/openvpn.conf START"
         cat /etc/openvpn/openvpn.conf
         echo "--> /etc/openvpn/openvpn.conf END"
@@ -93,7 +84,7 @@ function checkUpdateConfig {
     mkdir -p $OPENVPN/clients
 
     # Creating users
-    for USER in $(echo ${USERS:-} | sed "s/,/ /g")
+    for USER in $(echo ${USERS:-} | sed 's/[[:space:]]//g' | sed "s/,/ /g")
     do
         echo -n "--> Checking $USER... "
         if [ -f "$EASYRSA_PKI/private/$USER.key" ]; then
@@ -110,7 +101,81 @@ function checkUpdateConfig {
                 ovpn_otp_user $USER > $OPENVPN/clients/$USER.mfa
             fi
 		else
-            for REVOKE_USER in $(echo $REVOKE_USERS | sed "s/,/ /g")
+            for REVOKE_USER in $(echo $REVOKE_USERS | sed 's/[[:space:]]//g' | sed "s/,/ /g")
+            do
+                if [ "${USER}" == "${REVOKE_USER}" ]; then
+                    echo -n "--> Skipping $USER creation... User to be revoked"
+		    	else
+		    	    echo "NOT found"
+                    echo "==> Creating user: $USER..."
+	                easyrsa build-client-full $USER nopass
+                    ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
+                    if [ "${MFA:-false}" == "true" ]; then
+                        echo "    MFA enabled, setting OTP"
+                        ovpn_otp_user $USER > $OPENVPN/clients/$USER.mfa
+                    fi
+                fi
+            done
+		fi
+    done
+
+    # Revoking users
+    for REVOKE_USER in $(echo ${REVOKE_USERS:-} | sed 's/[[:space:]]//g' | sed "s/,/ /g")
+    do
+        echo -n "--> Checking to revoke $REVOKE_USER... "
+        if [ ! -f "$EASYRSA_PKI/private/${REVOKE_USER}.key" ]; then
+            echo "Doesnt exist, skipping revoke"
+            continue
+        fi
+		if [ -f $OPENVPN/clients/${REVOKE_USER}-REVOKED.ovpn ]; then
+		    echo "User already revoked, skipping..."
+			continue
+		else
+		    echo "Found"
+            echo "==> Revoking user: ${REVOKE_USER}..."
+            ovpn_revokeclient $REVOKE_USER remove
+            mv $OPENVPN/clients/${REVOKE_USER}.ovpn $OPENVPN/clients/${REVOKE_USER}-REVOKED.ovpn
+            if [ "${MFA:-false}" == "true" ]; then
+                mv $OPENVPN/clients/${REVOKE_USER}.mfa $OPENVPN/clients/${REVOKE_USER}-REVOKED.mfa
+            fi
+		fi
+    done
+
+    if [ ! -z "${S3_BUCKET:-}" ]; then
+        # Syncing ovpn files to S3
+        echo "--> Syncing ovpn client files to S3"
+        aws s3 sync $OPENVPN/clients/ s3://${S3_BUCKET} --delete
+    fi
+
+}
+
+function syncUsers {
+    echo "--> Checking Users..."
+
+    USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /${NAME:-openvpn}/USERS --output text --query 'Parameter.Value')
+    REVOKE_USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /${NAME:-openvpn}/REVOKE_USERS --output text --query 'Parameter.Value')
+
+    mkdir -p $OPENVPN/clients
+
+    # Creating users
+    for USER in $(echo ${USERS:-} | sed 's/[[:space:]]//g' | sed "s/,/ /g")
+    do
+        echo -n "--> Checking $USER... "
+        if [ -f "$EASYRSA_PKI/private/$USER.key" ]; then
+            echo "Found"
+            continue
+        fi
+		if [ "${REVOKE_USERS}" == "," ]; then
+		    echo "Revoke is empty"
+            echo "==> Creating user: $USER..."
+	        easyrsa build-client-full $USER nopass
+			ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
+            if [ "${MFA:-false}" == "true" ]; then
+                echo "    MFA enabled, setting OTP"
+                ovpn_otp_user $USER > $OPENVPN/clients/$USER.mfa
+            fi
+		else
+            for REVOKE_USER in $(echo $REVOKE_USERS | sed 's/[[:space:]]//g' | sed "s/,/ /g")
             do
                 if [ "${USER}" == "${REVOKE_USER}" ]; then
                     echo -n "--> Skipping $USER creation... User to be revoked"
@@ -206,14 +271,14 @@ if [ $? = 0 ]; then
     sysctl -w net.ipv6.conf.all.forwarding=1 || echo "Failed to enable IPv6 Forwarding"
 fi
 
-function loopCheckUpdateConfig {
+function loopsyncUsers {
     while true; do
-        checkUpdateConfig &
-        sleep 60
+        syncUsers &
+        sleep ${SYNCTIME:-1800}
     done
 }
 
-loopCheckUpdateConfig &
+loopsyncUsers &
 
 echo "Running 'openvpn ${ARGS[@]} ${USER_ARGS[@]}'"
 exec openvpn ${ARGS[@]} ${USER_ARGS[@]}
