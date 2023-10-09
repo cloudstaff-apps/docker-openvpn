@@ -83,6 +83,13 @@ function checkUpdateConfig {
 
     mkdir -p $OPENVPN/clients
 
+    # Before creating users sync profiles stored in s3
+    if [ ! -z "${S3_BUCKET:-}" ]; then
+        # Syncing ovpn files to S3
+        echo "--> Syncing ovpn client files to S3"
+        aws s3 sync s3://${S3_BUCKET} $OPENVPN/clients/
+    fi
+
     # Creating users
     for USER in $(echo ${USERS:-} | sed 's/[[:space:]]//g' | sed "s/,/ /g")
     do
@@ -157,6 +164,13 @@ function syncUsers {
 
     mkdir -p $OPENVPN/clients
 
+    # Before creating users sync profiles stored in s3
+    if [ ! -z "${S3_BUCKET:-}" ]; then
+        # Syncing ovpn files to S3
+        echo "--> Syncing ovpn client files to S3"
+        aws s3 sync s3://${S3_BUCKET} $OPENVPN/clients/
+    fi
+    
     # Creating users
     for USER in $(echo ${USERS:-} | sed 's/[[:space:]]//g' | sed "s/,/ /g")
     do
