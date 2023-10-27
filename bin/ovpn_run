@@ -170,7 +170,7 @@ function syncUsers {
         echo "--> Syncing ovpn client files to S3"
         aws s3 sync s3://${S3_BUCKET} $OPENVPN/clients/
     fi
-    
+
     # Creating users
     for USER in $(echo ${USERS:-} | sed 's/[[:space:]]//g' | sed "s/,/ /g")
     do
