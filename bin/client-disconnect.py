@@ -1,85 +1,47 @@
 #!/usr/bin/python3
 
-import time
-import boto3
-import os
+import os, sys
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import SYNCHRONOUS
 
-from botocore.config import Config
+if len(sys.argv) < 3:
+    print("Usage: python client-disconnect.py <InfluxDB Access Token> <VPN Name>")
+    sys.exit(1)
 
-# Define default values
-DEFAULT_DATABASE_NAME = "CSMonitoringDB"
-DEFAULT_TABLE_NAME = "VpnUses"
-DEFAULT_TIMESTREAM_REGION = "us-west-2"
+# Command-line arguments
+token = sys.argv[1]
+vpn_name = sys.argv[2]
 
-# Get values from environment variables or use default values
-DATABASE_NAME = os.environ.get('DATABASE_NAME', DEFAULT_DATABASE_NAME)
-TABLE_NAME = os.environ.get('TABLE_NAME', DEFAULT_TABLE_NAME)
-TIMESTREAM_REGION = os.environ.get('TABLE_NAME', DEFAULT_TIMESTREAM_REGION)
+# InfluxDB connection details (modify as needed)
+org = "cloudstaff"
+bucket = "vpnuses"
+url = "https://metrics.cloudstaff.com:8443"
 
-def prepare_common_attributes():
-    common_attributes = {
-        'Dimensions': [
-            {'Name': 'domain_name', 'Value': os.environ['DOMAIN_NAME']},
-            {'Name': 'common_name', 'Value': os.environ['common_name']}
-        ]
-    }
-    return common_attributes
+# Create InfluxDB client
+client = InfluxDBClient(url=url, token=token, org=org)
 
-def prepare_record(current_time, name, localip, remoteip, bytesrec, bytessent, duration):
-    record = {
-        'Time': str(current_time),
-        'MeasureValues': [
-            prepare_measure('name', name),
-            prepare_measure('localip', localip),
-            prepare_measure('remoteip', remoteip),
-            prepare_measure('bytes_received', bytesrec),
-            prepare_measure('bytes_sent', bytessent),
-            prepare_measure('time_duration', duration)
-        ]
-    }
-    return record
+# Create a write API
+write_api = client.write_api(write_options=SYNCHRONOUS)
 
-def prepare_measure(measure_name, measure_value):
-    measure_type = 'DOUBLE' if measure_value != 'TIMESTAMP' else 'TIMESTAMP'
-    measure = {
-        'Name': measure_name,
-        'Value': str(measure_value),
-        'Type': measure_type
-    }
-    return measure
+try:
+    # Get values from environment variables
+    remoteip = os.environ.get('untrusted_ip', '')
+    bytesrec = int(os.environ.get('bytes_received', '0'))
+    bytessent = int(os.environ.get('bytes_sent', '0'))
+    duration = int(os.environ.get('time_duration', '0'))
+    common_name = os.environ.get('common_name', '')
 
-def write_records(records, common_attributes):
-    try:
-        session = boto3.Session(region_name=TIMESTREAM_REGION)
-        write_client = session.client('timestream-write', config=Config(
-            read_timeout=20, max_pool_connections=5000, retries={'max_attempts': 10}))
+    # Create a Point with tags and fields
+    point = Point("vpnuses").tag("common_name", common_name).tag("vpn_name", vpn_name).field("remoteip", remoteip).field("bytes_received", bytesrec).field("bytes_sent", bytessent).field("time_duration", duration)
 
-        result = write_client.write_records(DatabaseName=DATABASE_NAME,
-                                            TableName=TABLE_NAME,
-                                            CommonAttributes=common_attributes,
-                                            Records=records)
-        status = result['ResponseMetadata']['HTTPStatusCode']
-        print("Processed %d records. WriteRecords HTTPStatusCode: %s" %
-              (len(records), status))
-    except Exception as err:
-        print("Error:", err)
+    # Write the point to InfluxDB
+    write_api.write(bucket=bucket, record=point)
 
-if __name__ == '__main':
-    print("writing data to database {} table {}".format(
-        DATABASE_NAME, TABLE_NAME))
+    print("Data written to InfluxDB successfully")
 
-    common_attributes = prepare_common_attributes()
-    records = []
+except Exception as e:
+    print(f"Error writing data to InfluxDB: {e}")
 
-    current_time = int(time.time() * 1000)
-    name = os.environ['common_name']
-    localip = os.environ['ifconfig_pool_remote_ip']
-    remoteip = os.environ['untrusted_ip']
-    bytesrec = os.environ['bytes_received']
-    bytessent = os.environ['bytes_sent']
-    duration = os.environ['time_duration']
-
-    record = prepare_record(current_time, name, localip, remoteip, bytesrec, bytessent, duration)
-    records.append(record)
-
-    write_records(records, common_attributes)
+finally:
+    # Close the InfluxDB client
+    client.close()

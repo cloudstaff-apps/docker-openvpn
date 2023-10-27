@@ -334,9 +334,8 @@ proto $OVPN_PROTO
 # Rely on Docker to do port mapping, internally always 1194
 port 1194
 dev $OVPN_DEVICE$OVPN_DEVICEN
-status /proc/self/fd/1
 
-client-disconnect /usr/local/bin/client-disconnect.py
+client-disconnect "/usr/local/bin/client-disconnect.py $METRICS_TOKEN $NAME"
 script-security 2
 
 user nobody
