@@ -37,7 +37,7 @@ try:
     # Write the point to InfluxDB
     write_api.write(bucket=bucket, record=point)
 
-    print("Data written to InfluxDB successfully")
+    print(f"common_name: {common_name}, duration: {duration}, remoteip: {remoteip}, bytesrec: {bytesrec}")
 
 except Exception as e:
     print(f"Error writing data to InfluxDB: {e}")
