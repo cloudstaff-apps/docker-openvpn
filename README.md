@@ -114,6 +114,70 @@ then be given to a client for access to the VPN.
 
 To enable Two Factor Authentication for clients (a.k.a. OTP) see [this document](/docs/otp.md).
 
+## Cloudstaff PKI Maintenance Scripts
+
+Beyond the upstream `ovpn_genconfig` / `ovpn_initpki` / `ovpn_run` flow above, this fork adds
+scripts for managing certificate lifecycle on a long-running server without ever recreating the
+PKI. They're installed to `/usr/local/bin` (and `ovpn_pki_lib` to `/usr/local/lib`) by the
+Dockerfile. All of them except `ovpn_pki_lib` are meant to be run against a live container, e.g.:
+
+    docker exec <container> ovpn_cert_audit
+    docker exec <container> ovpn_renew_server
+
+- **`ovpn_pki_lib`** &mdash; not a command; a shared library every script below sources. Defines
+  `log`/`warn`/`die`, the PKI write lock (`acquire_pki_lock`/`release_pki_lock`, via `flock` &mdash;
+  requires the real `util-linux` `flock`, not BusyBox's, since BusyBox's doesn't support `-w`),
+  certificate helpers (`cert_is_current`, `verify_cert_against_ca`, `verify_cert_key_match`,
+  `cert_fingerprint`/`cert_serial`), and `backup_openvpn_state` (tars `pki/` + `clients/` into
+  `/etc/openvpn/backups` before any write happens). It also works around Easy-RSA 3.1+'s
+  "Missing vars file" hard-failure by creating an empty vars file if `EASYRSA_VARS_FILE` is
+  exported but nothing exists there yet &mdash; this matters for any PKI that predates that
+  variable, i.e. every pre-2026 production PKI.
+
+- **`ovpn_cert_audit [--days N] [--active-users]`** &mdash; read-only. Lists every issued
+  certificate's status (`VALID` / `EXPIRING_<N>D` / `EXPIRED` / `MISSING`) and expiry date.
+  `--active-users` restricts the check to `$DOMAIN_NAME` plus the users currently listed in the
+  `/${NAME:-openvpn}/USERS` SSM parameter, instead of every cert ever issued (including
+  revoked/former users). Exits 2 if anything has expired &mdash; safe to wire into a monitoring
+  check.
+
+- **`ovpn_renew_server [--days N] [SERVER_NAME]`** &mdash; renews only the server certificate in
+  place: backs up state, runs `easyrsa renew`, then verifies the CA fingerprint and private key
+  are unchanged, the serial actually changed, and the new cert verifies against the CA with
+  `sslserver` purpose &mdash; refuses (dies) if any check fails. Defaults to `$DOMAIN_NAME` and
+  `$CERT_DAYS` (1095 days). **Requires a full container/task restart afterward** &mdash; OpenVPN
+  only reads the server cert once at startup, and SIGHUP is unsafe after it drops privileges.
+  Don't run `revoke-renewed` until the new cert is confirmed deployed and working.
+
+- **`ovpn_renew_user [--days N] USER [USER ...]`** &mdash; same renew-and-verify pattern, for one
+  or more client certificates. Does not touch OTP/MFA enrollment and does not regenerate `.ovpn`
+  profiles &mdash; that's the deliberate next step, `ovpn_update_profile`. No restart needed: the
+  server validates whatever cert a client presents at connect time, per-connection.
+
+- **`ovpn_update_profile [--no-upload] USER [USER ...]`** &mdash; regenerates the inline `.ovpn`
+  file for a user, verifies the regenerated profile actually embeds the currently-issued
+  certificate (not a stale one), and uploads it to `s3://$S3_BUCKET/[$S3_PREFIX/]$USER.ovpn`
+  unless `--no-upload` is passed or `S3_BUCKET` is unset. Verifies the uploaded object is
+  non-empty via `head-object` before declaring success.
+
+- **`ovpn_revokeclient CN [keep|remove]`** &mdash; revokes a client certificate and regenerates
+  the CRL. `keep` (default) leaves the cert/key/request files on disk; `remove` deletes them
+  after revocation.
+
+All of these operate on one region/container at a time, by hand, on purpose &mdash; there's no
+fleet-wide "renew everything" command in this repo. See `infra-cloudstaff-openvpn/scripts/` for
+the tooling that drives these across the actual ECS fleet (deploying new images, running these
+commands remotely via SSM, and auditing every region's cert status at once).
+
+### Automatic client-cert renewal
+
+`ovpn_run`'s background loop calls its user-sync routine every `$SYNCTIME` seconds (default
+1800s / 30 min). As part of that cycle, if `AUTO_RENEW_CLIENT_CERTS=true` (the default) it
+detects any active user whose client cert is within `$AUTO_RENEW_DAYS` of expiring and renews it
+plus regenerates/re-uploads their profile automatically, using the same renew-and-verify logic as
+`ovpn_renew_user`/`ovpn_update_profile` above. It doesn't touch OTP/MFA, and doesn't need a
+restart, for the same reason manual client renewal doesn't.
+
 ## OpenVPN Details
 
 We use `tun` mode, because it works on the widest range of devices.
