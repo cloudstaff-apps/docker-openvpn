@@ -32,6 +32,17 @@ jobs:
         uses: docker/metadata-action@9ec57ed1fcdbf14dcef7dfbe97b2010124a938b7
         with:
           images: cloudstaff/docker-openvpn
+          # Without this, type=ref,event=tag (the default rule for a
+          # release-triggered build) also auto-tags :latest -- confirmed
+          # against docker/metadata-action's documented defaults on
+          # 2026-07-13. Regions with no explicit image pin in config.yaml
+          # (the "Don't Modify, Out of Sync" workspaces) could otherwise
+          # pick up an unvalidated image on their next unrelated restart.
+          # Every environment should move to a new version by deliberately
+          # updating its task definition's image tag, never by implicitly
+          # following :latest.
+          flavor: |
+            latest=false
       
       - name: Build and push Docker image
         uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671

@@ -14,6 +14,11 @@ services:
       AWS_DEFAULT_REGION: us-west-2
       MFA: true
       OVPN_PROTO: tcp
+      # ovpn_genconfig has always required this (it's embedded in the
+      # client-disconnect directive); production gets it from an ECS
+      # task secret. Needs a real value here only if you actually want
+      # client-disconnect.py posting metrics somewhere for local testing.
+      METRICS_TOKEN: local-test-token
     env_file:
       - .aws-keys
     container_name: openvpn

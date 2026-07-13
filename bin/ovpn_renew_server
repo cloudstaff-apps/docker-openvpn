@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+# shellcheck source=/usr/local/lib/ovpn_pki_lib
+source "${OVPN_PKI_LIB:-/usr/local/lib/ovpn_pki_lib}"
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  ovpn_renew_server [--days N] [SERVER_NAME]
+
+Defaults:
+  SERVER_NAME = $DOMAIN_NAME
+  days        = $CERT_DAYS or 1095
+
+This command:
+  - acquires the shared PKI write lock;
+  - backs up /etc/openvpn/pki and /etc/openvpn/clients;
+  - renews only the server certificate;
+  - preserves and verifies the existing private key;
+  - does not recreate the CA;
+  - does not restart OpenVPN.
+
+After success, perform a full ECS task/container restart. Do not use SIGHUP.
+USAGE
+}
+
+DAYS="$CERT_DAYS"
+SERVER_NAME="${DOMAIN_NAME:-}"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --days)
+            [ "$#" -ge 2 ] || die "--days requires a value"
+            DAYS="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --*)
+            die "Unknown option: $1"
+            ;;
+        *)
+            [ -z "$SERVER_NAME" ] || die "Server name supplied more than once"
+            SERVER_NAME="$1"
+            shift
+            ;;
+    esac
+done
+
+[ -n "$SERVER_NAME" ] || die "SERVER_NAME is required; set DOMAIN_NAME or pass it as an argument"
+[[ "$DAYS" =~ ^[0-9]+$ ]] && [ "$DAYS" -gt 0 ] || die "Invalid certificate lifetime: $DAYS"
+
+validate_identity "$SERVER_NAME"
+require_command easyrsa
+require_command openssl
+require_command sha256sum
+require_command tar
+ensure_pki_exists
+
+CERT="$EASYRSA_PKI/issued/$SERVER_NAME.crt"
+KEY="$EASYRSA_PKI/private/$SERVER_NAME.key"
+
+require_file "$CERT"
+require_file "$KEY"
+verify_cert_key_match "$CERT" "$KEY" || die "Existing server certificate does not match its private key"
+
+OLD_CA_FP="$(cert_fingerprint "$EASYRSA_PKI/ca.crt")"
+OLD_KEY_HASH="$(key_pubkey_hash "$KEY")"
+OLD_CERT_FP="$(cert_fingerprint "$CERT")"
+OLD_SERIAL="$(cert_serial "$CERT")"
+
+acquire_pki_lock
+trap cleanup_on_exit EXIT
+
+log "Current server certificate:"
+print_cert_summary "$CERT"
+backup_openvpn_state "renew-server-${SERVER_NAME}"
+
+log "Renewing server certificate '$SERVER_NAME' for $DAYS days"
+easyrsa --batch --days="$DAYS" renew "$SERVER_NAME"
+
+require_file "$CERT"
+require_file "$KEY"
+verify_cert_against_ca "$CERT" sslserver || die "Renewed server certificate failed CA/purpose verification"
+verify_cert_key_match "$CERT" "$KEY" || die "Renewed server certificate does not match its private key"
+
+NEW_CA_FP="$(cert_fingerprint "$EASYRSA_PKI/ca.crt")"
+NEW_KEY_HASH="$(key_pubkey_hash "$KEY")"
+NEW_CERT_FP="$(cert_fingerprint "$CERT")"
+NEW_SERIAL="$(cert_serial "$CERT")"
+
+[ "$NEW_CA_FP" = "$OLD_CA_FP" ] || die "CA fingerprint changed unexpectedly"
+[ "$NEW_KEY_HASH" = "$OLD_KEY_HASH" ] || die "Server private key changed unexpectedly"
+[ "$NEW_CERT_FP" != "$OLD_CERT_FP" ] || die "Renewal did not produce a new certificate"
+[ "$NEW_SERIAL" != "$OLD_SERIAL" ] || die "Renewal did not produce a new serial number"
+cert_is_current "$CERT" || die "Renewed server certificate is not currently valid"
+
+log "Renewed server certificate:"
+print_cert_summary "$CERT"
+log "Server certificate renewal completed successfully"
+log "Required next action: perform a full ECS task/container restart; do not send SIGHUP"
+log "Do not run revoke-renewed until the renewed certificate is deployed and tested"

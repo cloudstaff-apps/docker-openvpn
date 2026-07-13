@@ -1,246 +1,512 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-#
-# Run the OpenVPN server normally
-#
+# OpenVPN container entrypoint with safe PKI initialization, certificate
+# validation, serialized user reconciliation, and backward-compatible S3 sync.
 
-if [ "$DEBUG" == "1" ]; then
-  set -x
+set -Eeo pipefail
+
+if [ "${DEBUG:-0}" = "1" ]; then
+    set -x
 fi
 
-set -e
+: "${OPENVPN:=/etc/openvpn}"
+: "${EASYRSA_PKI:=${OPENVPN}/pki}"
+: "${OVPN_PROTO:=udp}"
+: "${CIPHER:=AES-256-GCM}"
+: "${SYNCTIME:=1800}"
+: "${CERT_WARN_DAYS:=30}"
+: "${PKI_WRITER:=true}"
+: "${S3_ALLOW_DELETE:=false}"
+: "${AUTO_RENEW_CLIENT_CERTS:=true}"
+: "${AUTO_RENEW_DAYS:=${CERT_DAYS:-1095}}"
 
-cd $OPENVPN
+# Set once per syncUsers() cycle so a batch of simultaneously-expired users
+# (a whole cohort issued on the same day, which happens in practice) only
+# triggers one backup, not one per user.
+CYCLE_BACKUP_DONE=false
 
-# Build runtime arguments array based on environment
-USER_ARGS=("${@}")
+export OPENVPN EASYRSA_PKI
+
+# shellcheck source=/usr/local/lib/ovpn_pki_lib
+source "${OVPN_PKI_LIB:-/usr/local/lib/ovpn_pki_lib}"
+
+cd "$OPENVPN"
+
+USER_ARGS=("$@")
 ARGS=()
-CIPHER=AES-256-GCM
+SERVER_NAME="${DOMAIN_NAME:-vpn.server.address}"
+SERVER_CERT="$EASYRSA_PKI/issued/$SERVER_NAME.crt"
+SERVER_KEY="$EASYRSA_PKI/private/$SERVER_NAME.key"
+CA_CERT="$EASYRSA_PKI/ca.crt"
 
-set +u
-
-[ -z "$OVPN_PROTO" ] && OVPN_PROTO=udp
-
-# Checks if ARGS already contains the given value
-function hasArg {
+hasArg() {
+    local wanted="$1"
+    shift
     local element
-    for element in "${@:2}"; do
-        [ "${element}" == "${1}" ] && return 0
+
+    for element in "$@"; do
+        [ "$element" = "$wanted" ] && return 0
     done
+
     return 1
 }
 
-# Adds the given argument if it's not already specified.
-function addArg {
-    local arg="${1}"
-    [ $# -ge 1 ] && local val="${2}"
-    if ! hasArg "${arg}" "${USER_ARGS[@]}"; then
-        ARGS+=("${arg}")
-        [ $# -ge 1 ] && ARGS+=("${val}")
+addArg() {
+    local arg="$1"
+    shift
+
+    if ! hasArg "$arg" "${USER_ARGS[@]}"; then
+        ARGS+=("$arg")
+        [ "$#" -gt 0 ] && ARGS+=("$1")
     fi
 }
 
-# set up iptables rules and routing
-# this allows rules/routing to be altered by supplying this function
-# in an included file, such as ovpn_env.sh
-function setupIptablesAndRouting {
-    iptables -t nat -C POSTROUTING -s $OVPN_SERVER -o $OVPN_NATDEVICE -j MASQUERADE || {
-      iptables -t nat -A POSTROUTING -s $OVPN_SERVER -o $OVPN_NATDEVICE -j MASQUERADE
-    }
-    for i in "${OVPN_ROUTES[@]}"; do
-        iptables -t nat -C POSTROUTING -s "$i" -o $OVPN_NATDEVICE -j MASQUERADE || {
-          iptables -t nat -A POSTROUTING -s "$i" -o $OVPN_NATDEVICE -j MASQUERADE
-        }
+setupIptablesAndRouting() {
+    iptables -t nat -C POSTROUTING \
+        -s "$OVPN_SERVER" \
+        -o "$OVPN_NATDEVICE" \
+        -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A POSTROUTING \
+        -s "$OVPN_SERVER" \
+        -o "$OVPN_NATDEVICE" \
+        -j MASQUERADE
+
+    local route
+    for route in "${OVPN_ROUTES[@]:-}"; do
+        [ -n "$route" ] || continue
+
+        iptables -t nat -C POSTROUTING \
+            -s "$route" \
+            -o "$OVPN_NATDEVICE" \
+            -j MASQUERADE 2>/dev/null \
+        || iptables -t nat -A POSTROUTING \
+            -s "$route" \
+            -o "$OVPN_NATDEVICE" \
+            -j MASQUERADE
     done
 }
 
-function checkUpdateConfig {
-    echo "--> Checking Config..."
+aws_region_args() {
+    AWS_REGION_ARGS=()
+    local region="${AWS_DEFAULT_REGION:-${AWS_REGION:-}}"
+    [ -n "$region" ] && AWS_REGION_ARGS=(--region "$region")
+}
 
-    USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /${NAME:-openvpn}/USERS --output text --query 'Parameter.Value')
-    REVOKE_USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /${NAME:-openvpn}/REVOKE_USERS --output text --query 'Parameter.Value')
+ssm_get_parameter() {
+    local parameter_name="$1"
+    local attempt
 
-    # Generate config and init PKI
-    if [ ! -f "$EASYRSA_PKI/issued/${DOMAIN_NAME:-vpn.server.address}.crt" ]; then
-        echo "==> Domain certificate not found, recreating PKI..."
-        if [ -d "$EASYRSA_PKI" ]; then
-            mv $EASYRSA_PKI $EASYRSA_PKI.$(date "+%s").bak
+    aws_region_args
+
+    for attempt in 1 2 3 4 5; do
+        if aws "${AWS_REGION_ARGS[@]}" ssm get-parameter \
+            --name "$parameter_name" \
+            --query Parameter.Value \
+            --output text; then
+            return 0
         fi
 
-        echo "==> Generating openvpn config"   
-        if [ "${MFA:-false}" == "true" ]; then
-            echo "--> MFA Enabled"
-            ovpn_genconfig -u ${OVPN_PROTO}://${DOMAIN_NAME:-vpn.server.address} -p "redirect-gateway def1" -2 -C ${CIPHER}
-        else
-            ovpn_genconfig -u ${OVPN_PROTO}://${DOMAIN_NAME:-vpn.server.address} -p "redirect-gateway def1"
-        fi
+        warn "Unable to read SSM parameter $parameter_name; attempt $attempt/5"
+        sleep $((attempt * 2))
+    done
 
-        echo "--> /etc/openvpn/openvpn.conf START"
-        cat /etc/openvpn/openvpn.conf
-        echo "--> /etc/openvpn/openvpn.conf END"
+    return 1
+}
+
+csv_lines() {
+    printf '%s' "${1:-}" \
+        | tr ',' '\n' \
+        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d' \
+        | sort -u
+}
+
+generate_openvpn_config() {
+    local endpoint="${OVPN_PROTO}://${SERVER_NAME}"
+
+    log "Generating OpenVPN configuration for $endpoint"
+
+    if [ "${MFA:-false}" = "true" ]; then
+        log "MFA enabled"
+        ovpn_genconfig \
+            -u "$endpoint" \
+            -p 'redirect-gateway def1' \
+            -2 \
+            -C "$CIPHER"
+    else
+        ovpn_genconfig \
+            -u "$endpoint" \
+            -p 'redirect-gateway def1'
+    fi
+}
+
+initialize_or_validate_pki() {
+    local ca_exists=false
+    local server_cert_exists=false
+    local server_key_exists=false
+
+    [ -f "$CA_CERT" ] && ca_exists=true
+    [ -f "$SERVER_CERT" ] && server_cert_exists=true
+    [ -f "$SERVER_KEY" ] && server_key_exists=true
+
+    if [ "$ca_exists" = false ] \
+        && [ "$server_cert_exists" = false ] \
+        && [ "$server_key_exists" = false ]; then
+
+        log "No existing PKI found; performing first-time initialization"
+        [ -f "$OPENVPN/openvpn.conf" ] || generate_openvpn_config
         ovpn_initpki nopass
+    elif [ "$ca_exists" = false ] \
+        || [ "$server_cert_exists" = false ] \
+        || [ "$server_key_exists" = false ]; then
+
+        die "Existing PKI is incomplete. Refusing to move, replace, or recreate it. CA=$ca_exists server_cert=$server_cert_exists server_key=$server_key_exists"
     fi
 
-    mkdir -p $OPENVPN/clients
+    [ -f "$OPENVPN/openvpn.conf" ] || generate_openvpn_config
 
-    # Before creating users sync profiles stored in s3
-    if [ ! -z "${S3_BUCKET:-}" ]; then
-        # Syncing ovpn files to S3
-        echo "--> Syncing ovpn client files to S3"
-        aws s3 sync s3://${S3_BUCKET} $OPENVPN/clients/
+    require_file "$CA_CERT"
+    require_file "$SERVER_CERT"
+    require_file "$SERVER_KEY"
+
+    if ! cert_is_current "$CA_CERT"; then
+        print_cert_summary "$CA_CERT" >&2
+        die "CA certificate is expired or not yet valid. CA replacement requires a separate migration plan"
     fi
 
-    # Creating users
-    for USER in $(echo ${USERS:-} | sed 's/[[:space:]]//g' | sed "s/,/ /g")
-    do
-        echo -n "--> Checking $USER... "
-        if [ -f "$EASYRSA_PKI/private/$USER.key" ]; then
-            echo "Found"
-            continue
-        fi
-		if [ "${REVOKE_USERS}" == "," ]; then
-		    echo "Revoke is empty"
-            echo "==> Creating user: $USER..."
-	        easyrsa build-client-full $USER nopass
-			ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
-            if [ "${MFA:-false}" == "true" ]; then
-                echo "    MFA enabled, setting OTP"
-                ovpn_otp_user $USER > $OPENVPN/clients/$USER.mfa
-            fi
-		else
-            for REVOKE_USER in $(echo $REVOKE_USERS | sed 's/[[:space:]]//g' | sed "s/,/ /g")
-            do
-                if [ "${USER}" == "${REVOKE_USER}" ]; then
-                    echo -n "--> Skipping $USER creation... User to be revoked"
-		    	else
-		    	    echo "NOT found"
-                    echo "==> Creating user: $USER..."
-	                easyrsa build-client-full $USER nopass
-                    ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
-                    if [ "${MFA:-false}" == "true" ]; then
-                        echo "    MFA enabled, setting OTP"
-                        ovpn_otp_user $USER > $OPENVPN/clients/$USER.mfa
-                    fi
-                fi
-            done
-		fi
-    done
-
-    # Revoking users
-    for REVOKE_USER in $(echo ${REVOKE_USERS:-} | sed 's/[[:space:]]//g' | sed "s/,/ /g")
-    do
-        echo -n "--> Checking to revoke $REVOKE_USER... "
-        if [ ! -f "$EASYRSA_PKI/private/${REVOKE_USER}.key" ]; then
-            echo "Doesnt exist, skipping revoke"
-            continue
-        fi
-		if [ -f $OPENVPN/clients/${REVOKE_USER}-REVOKED.ovpn ]; then
-		    echo "User already revoked, skipping..."
-			continue
-		else
-		    echo "Found"
-            echo "==> Revoking user: ${REVOKE_USER}..."
-            ovpn_revokeclient $REVOKE_USER remove
-            mv $OPENVPN/clients/${REVOKE_USER}.ovpn $OPENVPN/clients/${REVOKE_USER}-REVOKED.ovpn
-            if [ "${MFA:-false}" == "true" ]; then
-                mv $OPENVPN/clients/${REVOKE_USER}.mfa $OPENVPN/clients/${REVOKE_USER}-REVOKED.mfa
-            fi
-		fi
-    done
-
-    if [ ! -z "${S3_BUCKET:-}" ]; then
-        # Syncing ovpn files to S3
-        echo "--> Syncing ovpn client files to S3"
-        aws s3 sync $OPENVPN/clients/ s3://${S3_BUCKET} --delete
+    if ! cert_is_current "$SERVER_CERT"; then
+        print_cert_summary "$SERVER_CERT" >&2
+        die "Server certificate is expired or not yet valid. Run ovpn_renew_server, then fully restart the ECS task/container"
     fi
 
+    verify_cert_against_ca "$SERVER_CERT" sslserver || die "Server certificate failed CA/purpose verification"
+    verify_cert_key_match "$SERVER_CERT" "$SERVER_KEY" || die "Server certificate does not match its private key"
+
+    if cert_expires_within_days "$SERVER_CERT" "$CERT_WARN_DAYS"; then
+        warn "Server certificate expires within ${CERT_WARN_DAYS} days"
+        print_cert_summary "$SERVER_CERT" >&2
+    fi
 }
 
-function syncUsers {
-    echo "--> Checking Users..."
+s3_base_uri() {
+    local prefix
+    prefix="$(normalise_s3_prefix)"
 
-    USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /${NAME:-openvpn}/USERS --output text --query 'Parameter.Value')
-    REVOKE_USERS=$(aws --region $AWS_DEFAULT_REGION ssm get-parameter --name /${NAME:-openvpn}/REVOKE_USERS --output text --query 'Parameter.Value')
-
-    mkdir -p $OPENVPN/clients
-
-    # Before creating users sync profiles stored in s3
-    if [ ! -z "${S3_BUCKET:-}" ]; then
-        # Syncing ovpn files to S3
-        echo "--> Syncing ovpn client files to S3"
-        aws s3 sync s3://${S3_BUCKET} $OPENVPN/clients/
+    if [ -n "$prefix" ]; then
+        printf 's3://%s/%s/' "$S3_BUCKET" "$prefix"
+    else
+        printf 's3://%s/' "$S3_BUCKET"
     fi
-
-    # Creating users
-    for USER in $(echo ${USERS:-} | sed 's/[[:space:]]//g' | sed "s/,/ /g")
-    do
-        echo -n "--> Checking $USER... "
-        if [ -f "$EASYRSA_PKI/private/$USER.key" ]; then
-            echo "Found"
-            continue
-        fi
-		if [ "${REVOKE_USERS}" == "," ]; then
-		    echo "Revoke is empty"
-            echo "==> Creating user: $USER..."
-	        easyrsa build-client-full $USER nopass
-			ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
-            if [ "${MFA:-false}" == "true" ]; then
-                echo "    MFA enabled, setting OTP"
-                ovpn_otp_user $USER > $OPENVPN/clients/$USER.mfa
-            fi
-		else
-            for REVOKE_USER in $(echo $REVOKE_USERS | sed 's/[[:space:]]//g' | sed "s/,/ /g")
-            do
-                if [ "${USER}" == "${REVOKE_USER}" ]; then
-                    echo -n "--> Skipping $USER creation... User to be revoked"
-		    	else
-		    	    echo "NOT found"
-                    echo "==> Creating user: $USER..."
-	                easyrsa build-client-full $USER nopass
-                    ovpn_getclient $USER > $OPENVPN/clients/$USER.ovpn
-                    if [ "${MFA:-false}" == "true" ]; then
-                        echo "    MFA enabled, setting OTP"
-                        ovpn_otp_user $USER > $OPENVPN/clients/$USER.mfa
-                    fi
-                fi
-            done
-		fi
-    done
-
-    # Revoking users
-    for REVOKE_USER in $(echo ${REVOKE_USERS:-} | sed "s/,/ /g")
-    do
-        echo -n "--> Checking to revoke $REVOKE_USER... "
-        if [ ! -f "$EASYRSA_PKI/private/${REVOKE_USER}.key" ]; then
-            echo "Doesnt exist, skipping revoke"
-            continue
-        fi
-		if [ -f $OPENVPN/clients/${REVOKE_USER}-REVOKED.ovpn ]; then
-		    echo "User already revoked, skipping..."
-			continue
-		else
-		    echo "Found"
-            echo "==> Revoking user: ${REVOKE_USER}..."
-            ovpn_revokeclient $REVOKE_USER remove
-            mv $OPENVPN/clients/${REVOKE_USER}.ovpn $OPENVPN/clients/${REVOKE_USER}-REVOKED.ovpn
-            if [ "${MFA:-false}" == "true" ]; then
-                mv $OPENVPN/clients/${REVOKE_USER}.mfa $OPENVPN/clients/${REVOKE_USER}-REVOKED.mfa
-            fi
-		fi
-    done
-
-    if [ ! -z "${S3_BUCKET:-}" ]; then
-        # Syncing ovpn files to S3
-        echo "--> Syncing ovpn client files to S3"
-        aws s3 sync $OPENVPN/clients/ s3://${S3_BUCKET} --delete
-    fi
-
 }
 
-checkUpdateConfig
+sync_profiles_from_s3() {
+    [ -n "${S3_BUCKET:-}" ] || return 0
 
-addArg "--config" "$OPENVPN/openvpn.conf"
+    local uri
+    uri="$(s3_base_uri)"
+    aws_region_args
 
+    log "Syncing profiles from $uri"
+    aws "${AWS_REGION_ARGS[@]}" s3 sync \
+        "$uri" \
+        "$CLIENT_DIR/" \
+        --only-show-errors
+}
+
+sync_profiles_to_s3() {
+    [ -n "${S3_BUCKET:-}" ] || return 0
+
+    local uri prefix
+    local args=()
+    uri="$(s3_base_uri)"
+    prefix="$(normalise_s3_prefix)"
+    aws_region_args
+
+    # Never use --delete against a shared bucket root by default. It can remove
+    # profiles belonging to another independent PKI. --delete is allowed only
+    # with an isolated prefix or an explicit override.
+    if [ -n "$prefix" ] || [ "$S3_ALLOW_DELETE" = "true" ]; then
+        args+=(--delete)
+    fi
+
+    log "Syncing profiles to $uri"
+    aws "${AWS_REGION_ARGS[@]}" s3 sync \
+        "$CLIENT_DIR/" \
+        "$uri" \
+        "${args[@]}" \
+        --only-show-errors
+}
+
+ensure_client_profile() {
+    local username="$1"
+    local cert="$EASYRSA_PKI/issued/$username.crt"
+    local profile="$CLIENT_DIR/$username.ovpn"
+    local temp="$CLIENT_DIR/.${username}.ovpn.tmp.$$"
+
+    if profile_matches_issued_cert "$profile" "$cert"; then
+        return 0
+    fi
+
+    log "Generating current profile for $username"
+    umask 077
+    ovpn_getclient "$username" > "$temp"
+    [ -s "$temp" ] || {
+        rm -f "$temp"
+        warn "Generated profile is empty for $username"
+        return 1
+    }
+
+    profile_matches_issued_cert "$temp" "$cert" || {
+        rm -f "$temp"
+        warn "Generated profile does not contain the current certificate for $username"
+        return 1
+    }
+
+    mv -f "$temp" "$profile"
+    chmod 600 "$profile"
+}
+
+auto_renew_expired_client() {
+    local username="$1"
+    local cert="$EASYRSA_PKI/issued/$username.crt"
+    local key="$EASYRSA_PKI/private/$username.key"
+    local old_ca_fp old_key_hash old_serial new_ca_fp new_key_hash new_serial
+
+    if [ "$CYCLE_BACKUP_DONE" != true ]; then
+        backup_openvpn_state "auto-renew-cycle"
+        CYCLE_BACKUP_DONE=true
+    fi
+
+    old_ca_fp="$(cert_fingerprint "$EASYRSA_PKI/ca.crt")"
+    old_key_hash="$(key_pubkey_hash "$key")"
+    old_serial="$(cert_serial "$cert")"
+
+    log "Auto-renewing expired client certificate for $username (existing key/CA preserved, ${AUTO_RENEW_DAYS} days)"
+
+    if ! easyrsa --batch --days="$AUTO_RENEW_DAYS" renew "$username"; then
+        warn "Auto-renewal command failed for $username. Run manually: ovpn_renew_user '$username'"
+        return 1
+    fi
+
+    new_ca_fp="$(cert_fingerprint "$EASYRSA_PKI/ca.crt")"
+    new_key_hash="$(key_pubkey_hash "$key")"
+    new_serial="$(cert_serial "$cert")"
+
+    if [ "$old_ca_fp" != "$new_ca_fp" ] \
+        || [ "$old_key_hash" != "$new_key_hash" ] \
+        || [ "$old_serial" = "$new_serial" ] \
+        || ! cert_is_current "$cert" \
+        || ! verify_cert_against_ca "$cert" sslclient; then
+        warn "Auto-renewal for $username failed an invariant check (CA/key/serial/validity/purpose)."
+        warn "Treating as still expired. Run ovpn_cert_audit and fix manually -- do not trust this cert."
+        return 1
+    fi
+
+    log "Auto-renewal succeeded for $username: serial $old_serial -> $new_serial"
+    return 0
+}
+
+reconcile_active_user() {
+    local username="$1"
+    local cert="$EASYRSA_PKI/issued/$username.crt"
+    local key="$EASYRSA_PKI/private/$username.key"
+    local mfa_file="$CLIENT_DIR/$username.mfa"
+    local cert_exists=false
+    local key_exists=false
+
+    [ -f "$cert" ] && cert_exists=true
+    [ -f "$key" ] && key_exists=true
+
+    if [ "$cert_exists" = false ] && [ "$key_exists" = false ]; then
+        log "Creating user certificate: $username"
+        # --days explicit: build-client-full has no default that honors
+        # CERT_DAYS, so a brand-new user would otherwise silently get
+        # Easy-RSA's stock 825-day validity instead of our 3yr policy.
+        easyrsa --batch --days="${CERT_DAYS:-1095}" build-client-full "$username" nopass
+    elif [ "$cert_exists" = false ] || [ "$key_exists" = false ]; then
+        warn "Incomplete user credentials for $username: cert=$cert_exists key=$key_exists. Refusing to recreate the identity"
+        return 1
+    fi
+
+    if ! cert_is_current "$cert"; then
+        if [ "${AUTO_RENEW_CLIENT_CERTS}" = "true" ]; then
+            auto_renew_expired_client "$username" || {
+                print_cert_summary "$cert" >&2
+                return 1
+            }
+        else
+            warn "Client certificate expired for $username. Run: ovpn_renew_user '$username' && ovpn_update_profile '$username'"
+            print_cert_summary "$cert" >&2
+            return 1
+        fi
+    fi
+
+    if ! verify_cert_against_ca "$cert" sslclient; then
+        warn "Client certificate failed CA/purpose verification for $username"
+        return 1
+    fi
+
+    if ! verify_cert_key_match "$cert" "$key"; then
+        warn "Client certificate does not match its private key for $username"
+        return 1
+    fi
+
+    if cert_expires_within_days "$cert" "$CERT_WARN_DAYS"; then
+        warn "Client certificate for $username expires within ${CERT_WARN_DAYS} days"
+        print_cert_summary "$cert" >&2
+    fi
+
+    ensure_client_profile "$username" || return 1
+
+    if [ "${MFA:-false}" = "true" ] && [ ! -s "$mfa_file" ]; then
+        log "Creating initial OTP enrollment for $username"
+        ovpn_otp_user "$username" > "$mfa_file"
+        chmod 600 "$mfa_file"
+    fi
+}
+
+revoke_user_if_needed() {
+    local username="$1"
+    local cert="$EASYRSA_PKI/issued/$username.crt"
+    local key="$EASYRSA_PKI/private/$username.key"
+    local profile="$CLIENT_DIR/$username.ovpn"
+    local revoked_profile="$CLIENT_DIR/${username}-REVOKED.ovpn"
+    local mfa_file="$CLIENT_DIR/$username.mfa"
+    local revoked_mfa="$CLIENT_DIR/${username}-REVOKED.mfa"
+
+    if [ -f "$revoked_profile" ]; then
+        log "User already marked revoked: $username"
+        return 0
+    fi
+
+    if [ ! -f "$cert" ] && [ ! -f "$key" ]; then
+        log "User does not exist; skipping revocation: $username"
+        return 0
+    fi
+
+    if [ ! -f "$key" ]; then
+        warn "Cannot use ovpn_revokeclient for $username because the private key is missing"
+        return 1
+    fi
+
+    log "Revoking user: $username"
+    PKI_LOCK_HELD=true ovpn_revokeclient "$username" remove
+
+    [ ! -f "$profile" ] || mv -f "$profile" "$revoked_profile"
+    [ ! -f "$mfa_file" ] || mv -f "$mfa_file" "$revoked_mfa"
+
+    # Root-level sync intentionally avoids --delete. Remove only this revoked
+    # identity's active download objects so they cannot remain downloadable.
+    if [ -n "${S3_BUCKET:-}" ]; then
+        local base_uri
+        base_uri="$(s3_base_uri)"
+        aws_region_args
+
+        aws "${AWS_REGION_ARGS[@]}" s3 rm             "${base_uri}${username}.ovpn"             --only-show-errors || return 1
+
+        aws "${AWS_REGION_ARGS[@]}" s3 rm             "${base_uri}${username}.mfa"             --only-show-errors || true
+    fi
+}
+
+syncUsers() {
+    [ "$PKI_WRITER" = "true" ] || {
+        log "PKI_WRITER is not true; skipping user/PKI synchronization"
+        return 0
+    }
+
+    CYCLE_BACKUP_DONE=false
+
+    local users revoke_users
+    local username
+    local result=0
+    local users_parameter="/${NAME:-openvpn}/USERS"
+    local revoke_parameter="/${NAME:-openvpn}/REVOKE_USERS"
+    local -a active_list=()
+    local -a revoke_list=()
+    local -A revoked=()
+
+    if ! users="$(ssm_get_parameter "$users_parameter")"; then
+        warn "Skipping user synchronization because $users_parameter could not be read"
+        return 1
+    fi
+
+    if ! revoke_users="$(ssm_get_parameter "$revoke_parameter")"; then
+        warn "Skipping user synchronization because $revoke_parameter could not be read"
+        return 1
+    fi
+
+    mapfile -t active_list < <(csv_lines "$users")
+    mapfile -t revoke_list < <(csv_lines "$revoke_users")
+
+    for username in "${revoke_list[@]}"; do
+        revoked["$username"]=1
+    done
+
+    mkdir -p "$CLIENT_DIR"
+
+    if ! try_acquire_pki_lock; then
+        warn "Another PKI writer is active; skipping this synchronization cycle"
+        return 1
+    fi
+
+    if ! sync_profiles_from_s3; then
+        warn "S3 download failed; continuing with persistent local EFS profiles"
+        result=1
+    fi
+
+    for username in "${active_list[@]}"; do
+        if ! is_valid_identity "$username"; then
+            warn "Skipping invalid username from SSM: $username"
+            result=1
+            continue
+        fi
+
+        if [ -n "${revoked[$username]:-}" ]; then
+            log "Skipping active-user creation because user is in revoke list: $username"
+            continue
+        fi
+
+        reconcile_active_user "$username" || result=1
+    done
+
+    for username in "${revoke_list[@]}"; do
+        if ! is_valid_identity "$username"; then
+            warn "Skipping invalid username from revoke list: $username"
+            result=1
+            continue
+        fi
+        revoke_user_if_needed "$username" || result=1
+    done
+
+    if ! sync_profiles_to_s3; then
+        warn "S3 upload failed"
+        result=1
+    fi
+
+    release_pki_lock
+    return "$result"
+}
+
+loopSyncUsers() {
+    while true; do
+        if ! syncUsers; then
+            warn "User synchronization completed with one or more errors"
+        fi
+
+        sleep "$SYNCTIME"
+    done
+}
+
+initialize_or_validate_pki
+mkdir -p "$CLIENT_DIR"
+
+if ! syncUsers; then
+    warn "Initial user synchronization completed with one or more errors; starting OpenVPN with existing EFS state"
+fi
+
+addArg --config "$OPENVPN/openvpn.conf"
+
+# ovpn_env.sh is generated by ovpn_genconfig and defines routing variables.
+# shellcheck disable=SC1090
 source "$OPENVPN/ovpn_env.sh"
 
 mkdir -p /dev/net
@@ -249,50 +515,33 @@ if [ ! -c /dev/net/tun ]; then
 fi
 
 if [ -d "$OPENVPN/ccd" ]; then
-    addArg "--client-config-dir" "$OPENVPN/ccd"
+    addArg --client-config-dir "$OPENVPN/ccd"
 fi
 
-# When using --net=host, use this to specify nat device.
-[ -z "$OVPN_NATDEVICE" ] && OVPN_NATDEVICE=eth0
+: "${OVPN_NATDEVICE:=eth0}"
 
-# Setup NAT forwarding if requested
-if [ "$OVPN_DEFROUTE" != "0" ] || [ "$OVPN_NAT" == "1" ] ; then
-	# call function to setup iptables rules and routing
-	# this allows rules to be customized by supplying
-	# a replacement function in, for example, ovpn_env.sh
-	setupIptablesAndRouting
+if [ "${OVPN_DEFROUTE:-0}" != "0" ] || [ "${OVPN_NAT:-0}" = "1" ]; then
+    setupIptablesAndRouting
 fi
 
-# Use a copy of crl.pem as the CRL Needs to be readable by the user/group
-# OpenVPN is running as.  Only pass arguments to OpenVPN if it's found.
-if [ "$EASYRSA_PKI/crl.pem" -nt "$OPENVPN/crl.pem" ]; then
+if [ -f "$EASYRSA_PKI/crl.pem" ] \
+    && { [ ! -f "$OPENVPN/crl.pem" ] || [ "$EASYRSA_PKI/crl.pem" -nt "$OPENVPN/crl.pem" ]; }; then
     cp -f "$EASYRSA_PKI/crl.pem" "$OPENVPN/crl.pem"
     chmod 644 "$OPENVPN/crl.pem"
 fi
 
 if [ -r "$OPENVPN/crl.pem" ]; then
-    addArg "--crl-verify" "$OPENVPN/crl.pem"
+    addArg --crl-verify "$OPENVPN/crl.pem"
 fi
 
-ip -6 route show default 2>/dev/null
-if [ $? = 0 ]; then
-    echo "Enabling IPv6 Forwarding"
-    # If this fails, ensure the docker container is run with --privileged
-    # Could be side stepped with `ip netns` madness to drop privileged flag
-
-    sysctl -w net.ipv6.conf.all.disable_ipv6=0 || echo "Failed to enable IPv6 support"
-    sysctl -w net.ipv6.conf.default.forwarding=1 || echo "Failed to enable IPv6 Forwarding default"
-    sysctl -w net.ipv6.conf.all.forwarding=1 || echo "Failed to enable IPv6 Forwarding"
+if ip -6 route show default >/dev/null 2>&1; then
+    log "Enabling IPv6 forwarding"
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 || warn "Failed to enable IPv6 support"
+    sysctl -w net.ipv6.conf.default.forwarding=1 || warn "Failed to enable default IPv6 forwarding"
+    sysctl -w net.ipv6.conf.all.forwarding=1 || warn "Failed to enable IPv6 forwarding"
 fi
 
-function loopsyncUsers {
-    while true; do
-        syncUsers &
-        sleep ${SYNCTIME:-1800}
-    done
-}
+loopSyncUsers &
 
-loopsyncUsers &
-
-echo "Running 'openvpn ${ARGS[@]} ${USER_ARGS[@]}'"
-exec openvpn ${ARGS[@]} ${USER_ARGS[@]}
+log "Running OpenVPN"
+exec openvpn "${ARGS[@]}" "${USER_ARGS[@]}"

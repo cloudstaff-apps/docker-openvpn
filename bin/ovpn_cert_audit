@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+# shellcheck source=/usr/local/lib/ovpn_pki_lib
+source "${OVPN_PKI_LIB:-/usr/local/lib/ovpn_pki_lib}"
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  ovpn_cert_audit [--days N] [--active-users]
+
+Without --active-users, audits every certificate in pki/issued.
+With --active-users, audits DOMAIN_NAME plus users from:
+  /${NAME:-openvpn}/USERS in AWS Systems Manager Parameter Store.
+
+Exit codes:
+  0 = no expired certificates
+  2 = one or more expired certificates
+  1 = operational error
+USAGE
+}
+
+WARN_DAYS="$CERT_WARN_DAYS"
+ACTIVE_USERS=false
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --days)
+            [ "$#" -ge 2 ] || die "--days requires a value"
+            WARN_DAYS="$2"
+            shift 2
+            ;;
+        --active-users)
+            ACTIVE_USERS=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "Unknown argument: $1"
+            ;;
+    esac
+done
+
+[[ "$WARN_DAYS" =~ ^[0-9]+$ ]] || die "Invalid warning days: $WARN_DAYS"
+require_command openssl
+ensure_pki_exists
+
+CERTS=()
+
+if [ "$ACTIVE_USERS" = true ]; then
+    require_command aws
+    [ -n "${DOMAIN_NAME:-}" ] || die "DOMAIN_NAME must be set with --active-users"
+
+    aws_region_args
+    USERS="$(aws "${AWS_REGION_ARGS[@]}" ssm get-parameter \
+        --name "/${NAME:-openvpn}/USERS" \
+        --query Parameter.Value \
+        --output text)"
+
+    CERTS+=("$EASYRSA_PKI/issued/$DOMAIN_NAME.crt")
+
+    while IFS= read -r USERNAME; do
+        [ -n "$USERNAME" ] || continue
+        CERTS+=("$EASYRSA_PKI/issued/$USERNAME.crt")
+    done < <(
+        printf '%s' "$USERS" \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d' \
+            | sort -u
+    )
+else
+    while IFS= read -r -d '' CERT; do
+        CERTS+=("$CERT")
+    done < <(find "$EASYRSA_PKI/issued" -maxdepth 1 -type f -name '*.crt' -print0 | sort -z)
+fi
+
+EXPIRED=0
+EXPIRING=0
+VALID=0
+MISSING=0
+
+printf '%-18s %-35s %s\n' STATUS IDENTITY NOT_AFTER
+printf '%-18s %-35s %s\n' '------------------' '-----------------------------------' '------------------------'
+
+for CERT in "${CERTS[@]}"; do
+    IDENTITY="$(basename "$CERT" .crt)"
+
+    if [ ! -f "$CERT" ]; then
+        printf '%-18s %-35s %s\n' MISSING "$IDENTITY" '-'
+        MISSING=$((MISSING + 1))
+        continue
+    fi
+
+    NOT_AFTER="$(openssl x509 -in "$CERT" -noout -enddate | cut -d= -f2-)"
+
+    if ! cert_is_current "$CERT"; then
+        STATUS=EXPIRED
+        EXPIRED=$((EXPIRED + 1))
+    elif cert_expires_within_days "$CERT" "$WARN_DAYS"; then
+        STATUS="EXPIRING_${WARN_DAYS}D"
+        EXPIRING=$((EXPIRING + 1))
+    else
+        STATUS=VALID
+        VALID=$((VALID + 1))
+    fi
+
+    printf '%-18s %-35s %s\n' "$STATUS" "$IDENTITY" "$NOT_AFTER"
+done
+
+log "Audit summary: valid=$VALID expiring=$EXPIRING expired=$EXPIRED missing=$MISSING"
+
+[ "$EXPIRED" -eq 0 ] || exit 2

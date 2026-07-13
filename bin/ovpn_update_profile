@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+# shellcheck source=/usr/local/lib/ovpn_pki_lib
+source "${OVPN_PKI_LIB:-/usr/local/lib/ovpn_pki_lib}"
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  ovpn_update_profile [--no-upload] USER [USER ...]
+
+This command:
+  - validates the named user's certificate and private key;
+  - regenerates the inline .ovpn profile atomically;
+  - verifies that the profile embeds the current issued certificate;
+  - preserves any existing .mfa file;
+  - uploads the profile to S3 when S3_BUCKET is set, unless --no-upload is used.
+
+S3 object location:
+  s3://$S3_BUCKET/$USER.ovpn
+or, when S3_PREFIX is set:
+  s3://$S3_BUCKET/$S3_PREFIX/$USER.ovpn
+USAGE
+}
+
+UPLOAD=true
+USERS=()
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --no-upload)
+            UPLOAD=false
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --*)
+            die "Unknown option: $1"
+            ;;
+        *)
+            USERS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+[ "${#USERS[@]}" -gt 0 ] || die "At least one username is required"
+
+require_command ovpn_getclient
+require_command openssl
+require_command sha256sum
+ensure_pki_exists
+mkdir -p "$CLIENT_DIR"
+
+if [ "$UPLOAD" = true ] && [ -n "${S3_BUCKET:-}" ]; then
+    require_command aws
+fi
+
+acquire_pki_lock
+trap cleanup_on_exit EXIT
+
+for USERNAME in "${USERS[@]}"; do
+    validate_identity "$USERNAME"
+
+    CERT="$EASYRSA_PKI/issued/$USERNAME.crt"
+    KEY="$EASYRSA_PKI/private/$USERNAME.key"
+    PROFILE="$CLIENT_DIR/$USERNAME.ovpn"
+    TEMP="$CLIENT_DIR/.${USERNAME}.ovpn.tmp.$$"
+
+    require_file "$CERT"
+    require_file "$KEY"
+    cert_is_current "$CERT" || die "Client certificate is expired or not yet valid: $USERNAME"
+    verify_cert_against_ca "$CERT" sslclient || die "Client certificate failed CA/purpose verification: $USERNAME"
+    verify_cert_key_match "$CERT" "$KEY" || die "Client certificate does not match its private key: $USERNAME"
+
+    log "Generating client profile: $USERNAME"
+    umask 077
+    ovpn_getclient "$USERNAME" > "$TEMP"
+    [ -s "$TEMP" ] || die "Generated profile is empty: $TEMP"
+
+    profile_matches_issued_cert "$TEMP" "$CERT" \
+        || die "Generated profile does not embed the current issued certificate for $USERNAME"
+
+    mv -f "$TEMP" "$PROFILE"
+    chmod 600 "$PROFILE"
+
+    log "Profile updated: $PROFILE"
+
+    if [ "$UPLOAD" = true ] && [ -n "${S3_BUCKET:-}" ]; then
+        URI="$(s3_profile_uri "$USERNAME")"
+        log "Uploading profile: $URI"
+
+        aws_region_args
+        aws "${AWS_REGION_ARGS[@]}" s3 cp \
+            "$PROFILE" \
+            "$URI" \
+            --content-type application/x-openvpn-profile \
+            --only-show-errors
+
+        # Verify that the object exists and is non-empty.
+        SIZE="$(aws "${AWS_REGION_ARGS[@]}" s3api head-object \
+            --bucket "$S3_BUCKET" \
+            --key "${URI#s3://${S3_BUCKET}/}" \
+            --query ContentLength \
+            --output text)"
+
+        [[ "$SIZE" =~ ^[0-9]+$ ]] && [ "$SIZE" -gt 0 ] \
+            || die "Uploaded S3 object is missing or empty: $URI"
+
+        log "Profile upload verified: $URI ($SIZE bytes)"
+    elif [ "$UPLOAD" = true ]; then
+        warn "S3_BUCKET is not set; profile was updated locally only"
+    fi
+
+done
+
+log "All requested profiles were updated"
+log "Existing .mfa files and OTP enrollment were not modified"

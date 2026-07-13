@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+
+# Shared helpers for OpenVPN PKI maintenance scripts.
+# This file is intended to be sourced, not executed directly.
+
+: "${OPENVPN:=/etc/openvpn}"
+: "${EASYRSA_PKI:=${OPENVPN}/pki}"
+: "${CLIENT_DIR:=${OPENVPN}/clients}"
+: "${PKI_LOCK_FILE:=${OPENVPN}/.pki-write.lock}"
+: "${PKI_LOCK_TIMEOUT:=30}"
+: "${CERT_DAYS:=1095}"
+: "${CERT_WARN_DAYS:=30}"
+: "${BACKUP_DIR:=${OPENVPN}/backups}"
+
+export OPENVPN EASYRSA_PKI
+
+log() {
+    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
+}
+
+warn() {
+    log "WARNING: $*" >&2
+}
+
+die() {
+    log "ERROR: $*" >&2
+    exit 1
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+require_file() {
+    [ -f "$1" ] || die "Required file not found: $1"
+}
+
+is_valid_identity() {
+    local identity="${1:-}"
+    [ -n "$identity" ] || return 1
+
+    case "$identity" in
+        *[!A-Za-z0-9._@+-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+validate_identity() {
+    local identity="${1:-}"
+    is_valid_identity "$identity" || die "Invalid certificate identity: $identity"
+}
+
+try_acquire_pki_lock() {
+    require_command flock
+    mkdir -p "$(dirname "$PKI_LOCK_FILE")"
+
+    exec 9>"$PKI_LOCK_FILE"
+    flock -w "$PKI_LOCK_TIMEOUT" 9
+}
+
+acquire_pki_lock() {
+    if ! try_acquire_pki_lock; then
+        die "Could not acquire PKI write lock within ${PKI_LOCK_TIMEOUT}s: $PKI_LOCK_FILE"
+    fi
+}
+
+release_pki_lock() {
+    flock -u 9 2>/dev/null || true
+    exec 9>&- 2>/dev/null || true
+}
+
+ensure_pki_exists() {
+    require_file "$EASYRSA_PKI/ca.crt"
+    require_file "$EASYRSA_PKI/private/ca.key"
+    require_file "$EASYRSA_PKI/index.txt"
+}
+
+cert_pubkey_hash() {
+    local cert="$1"
+    openssl x509 -in "$cert" -pubkey -noout \
+        | openssl pkey -pubin -outform DER 2>/dev/null \
+        | sha256sum \
+        | awk '{print $1}'
+}
+
+key_pubkey_hash() {
+    local key="$1"
+    openssl pkey -in "$key" -pubout -outform DER 2>/dev/null \
+        | sha256sum \
+        | awk '{print $1}'
+}
+
+verify_cert_key_match() {
+    local cert="$1"
+    local key="$2"
+    local cert_hash key_hash
+
+    require_file "$cert"
+    require_file "$key"
+
+    cert_hash="$(cert_pubkey_hash "$cert")"
+    key_hash="$(key_pubkey_hash "$key")"
+
+    if [ "$cert_hash" != "$key_hash" ]; then
+        warn "Certificate public-key hash: $cert_hash"
+        warn "Private-key public-key hash: $key_hash"
+        warn "Certificate and private key do not match: $cert / $key"
+        return 1
+    fi
+}
+
+verify_cert_against_ca() {
+    local cert="$1"
+    local purpose="${2:-}"
+    local args=(-CAfile "$EASYRSA_PKI/ca.crt")
+
+    [ -n "$purpose" ] && args+=(-purpose "$purpose")
+    openssl verify "${args[@]}" "$cert" >/dev/null
+}
+
+cert_fingerprint() {
+    local cert="$1"
+    openssl x509 -in "$cert" -noout -fingerprint -sha256 \
+        | sed 's/^.*=//'
+}
+
+cert_serial() {
+    local cert="$1"
+    openssl x509 -in "$cert" -noout -serial | sed 's/^serial=//'
+}
+
+cert_is_current() {
+    local cert="$1"
+    openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1
+}
+
+cert_expires_within_days() {
+    local cert="$1"
+    local days="$2"
+    local seconds=$((days * 86400))
+
+    ! openssl x509 -in "$cert" -noout -checkend "$seconds" >/dev/null 2>&1
+}
+
+print_cert_summary() {
+    local cert="$1"
+    openssl x509 -in "$cert" -noout \
+        -subject -issuer -serial -dates -fingerprint -sha256
+}
+
+profile_cert_fingerprint() {
+    local profile="$1"
+
+    awk '
+        /<cert>/   {inside=1; next}
+        /<\/cert>/ {inside=0}
+        inside
+    ' "$profile" \
+        | openssl x509 -noout -fingerprint -sha256 2>/dev/null \
+        | sed 's/^.*=//'
+}
+
+profile_matches_issued_cert() {
+    local profile="$1"
+    local cert="$2"
+    local profile_fp issued_fp
+
+    [ -s "$profile" ] || return 1
+
+    profile_fp="$(profile_cert_fingerprint "$profile" || true)"
+    issued_fp="$(cert_fingerprint "$cert")"
+
+    [ -n "$profile_fp" ] && [ "$profile_fp" = "$issued_fp" ]
+}
+
+backup_openvpn_state() {
+    local reason="${1:-maintenance}"
+    local timestamp archive
+    local items=(pki)
+
+    [ "${SKIP_BACKUP:-false}" = "true" ] && {
+        warn "Skipping backup because SKIP_BACKUP=true"
+        return 0
+    }
+
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+
+    [ -d "$CLIENT_DIR" ] && items+=(clients)
+
+    timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+    archive="$BACKUP_DIR/openvpn-${reason}-${timestamp}.tar.gz"
+
+    tar -C "$OPENVPN" -czf "$archive" "${items[@]}"
+    chmod 600 "$archive"
+
+    log "Backup created: $archive"
+    sha256sum "$archive"
+}
+
+aws_region_args() {
+    AWS_REGION_ARGS=()
+    local region="${AWS_DEFAULT_REGION:-${AWS_REGION:-}}"
+    [ -n "$region" ] && AWS_REGION_ARGS=(--region "$region")
+}
+
+normalise_s3_prefix() {
+    local prefix="${S3_PREFIX:-}"
+    prefix="${prefix#/}"
+    prefix="${prefix%/}"
+    printf '%s' "$prefix"
+}
+
+s3_profile_uri() {
+    local username="$1"
+    local prefix
+
+    [ -n "${S3_BUCKET:-}" ] || die "S3_BUCKET is not set"
+    prefix="$(normalise_s3_prefix)"
+
+    if [ -n "$prefix" ]; then
+        printf 's3://%s/%s/%s.ovpn' "$S3_BUCKET" "$prefix" "$username"
+    else
+        printf 's3://%s/%s.ovpn' "$S3_BUCKET" "$username"
+    fi
+}
+
+cleanup_on_exit() {
+    release_pki_lock
+}

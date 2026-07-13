@@ -142,6 +142,19 @@ if [ -z "${EASYRSA_PKI:-}" ]; then
     export EASYRSA_PKI="$OPENVPN/pki"
 fi
 
+# Easy-RSA 3.1+ hard-fails ("Missing vars file") when EASYRSA_VARS_FILE is
+# exported (the Dockerfile always sets it) but nothing exists at that path.
+# 3.0.5 tolerated this silently -- confirmed as the cause of the
+# "Missing vars file: /etc/openvpn/vars" crash after moving to 3.2.6
+# (see kylemanna/docker-openvpn#608, a long-standing upstream bug this
+# repo never actually hit until the Easy-RSA version bump). An empty file
+# satisfies the existence check; all real PKI settings come from --batch
+# CLI flags, not vars directives, and this never overwrites a real vars
+# file if one is intentionally placed here later.
+if [ -n "${EASYRSA_VARS_FILE:-}" ] && [ ! -f "$EASYRSA_VARS_FILE" ]; then
+    : > "$EASYRSA_VARS_FILE"
+fi
+
 OVPN_AUTH=''
 OVPN_CIPHER=''
 OVPN_CLIENT_TO_CLIENT=''

@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+# shellcheck source=/usr/local/lib/ovpn_pki_lib
+source "${OVPN_PKI_LIB:-/usr/local/lib/ovpn_pki_lib}"
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  ovpn_renew_user [--days N] USER [USER ...]
+
+This command:
+  - acquires the shared PKI write lock;
+  - creates one backup before making changes;
+  - renews only the named client certificates;
+  - preserves and verifies each existing private key;
+  - does not change OTP/MFA enrollment;
+  - does not regenerate or upload .ovpn profiles.
+
+After renewal, run:
+  ovpn_update_profile USER [USER ...]
+USAGE
+}
+
+DAYS="$CERT_DAYS"
+USERS=()
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --days)
+            [ "$#" -ge 2 ] || die "--days requires a value"
+            DAYS="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --*)
+            die "Unknown option: $1"
+            ;;
+        *)
+            USERS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+[ "${#USERS[@]}" -gt 0 ] || die "At least one username is required"
+[[ "$DAYS" =~ ^[0-9]+$ ]] && [ "$DAYS" -gt 0 ] || die "Invalid certificate lifetime: $DAYS"
+
+require_command easyrsa
+require_command openssl
+require_command sha256sum
+require_command tar
+ensure_pki_exists
+
+for USERNAME in "${USERS[@]}"; do
+    validate_identity "$USERNAME"
+    require_file "$EASYRSA_PKI/issued/$USERNAME.crt"
+    require_file "$EASYRSA_PKI/private/$USERNAME.key"
+done
+
+acquire_pki_lock
+trap cleanup_on_exit EXIT
+backup_openvpn_state "renew-users"
+
+for USERNAME in "${USERS[@]}"; do
+    CERT="$EASYRSA_PKI/issued/$USERNAME.crt"
+    KEY="$EASYRSA_PKI/private/$USERNAME.key"
+
+    verify_cert_key_match "$CERT" "$KEY" || die "Existing client certificate does not match its private key for $USERNAME"
+
+    OLD_CA_FP="$(cert_fingerprint "$EASYRSA_PKI/ca.crt")"
+    OLD_KEY_HASH="$(key_pubkey_hash "$KEY")"
+    OLD_CERT_FP="$(cert_fingerprint "$CERT")"
+    OLD_SERIAL="$(cert_serial "$CERT")"
+
+    log "Current client certificate for '$USERNAME':"
+    print_cert_summary "$CERT"
+    log "Renewing client certificate '$USERNAME' for $DAYS days"
+
+    easyrsa --batch --days="$DAYS" renew "$USERNAME"
+
+    require_file "$CERT"
+    require_file "$KEY"
+    verify_cert_against_ca "$CERT" sslclient || die "Renewed client certificate failed CA/purpose verification for $USERNAME"
+    verify_cert_key_match "$CERT" "$KEY" || die "Renewed client certificate does not match its private key for $USERNAME"
+
+    NEW_CA_FP="$(cert_fingerprint "$EASYRSA_PKI/ca.crt")"
+    NEW_KEY_HASH="$(key_pubkey_hash "$KEY")"
+    NEW_CERT_FP="$(cert_fingerprint "$CERT")"
+    NEW_SERIAL="$(cert_serial "$CERT")"
+
+    [ "$NEW_CA_FP" = "$OLD_CA_FP" ] || die "CA fingerprint changed unexpectedly for $USERNAME"
+    [ "$NEW_KEY_HASH" = "$OLD_KEY_HASH" ] || die "Private key changed unexpectedly for $USERNAME"
+    [ "$NEW_CERT_FP" != "$OLD_CERT_FP" ] || die "Renewal did not produce a new certificate for $USERNAME"
+    [ "$NEW_SERIAL" != "$OLD_SERIAL" ] || die "Renewal did not produce a new serial number for $USERNAME"
+    cert_is_current "$CERT" || die "Renewed certificate is not currently valid for $USERNAME"
+
+    log "Renewed client certificate for '$USERNAME':"
+    print_cert_summary "$CERT"
+    log "Client certificate renewal completed: $USERNAME"
+done
+
+log "All requested client certificates were renewed"
+log "Next action: run ovpn_update_profile for the same users and have them re-import the new profiles"
+log "Do not run ovpn_otp_user; OTP/MFA enrollment is unchanged"
