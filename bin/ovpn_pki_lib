@@ -5,6 +5,7 @@
 
 : "${OPENVPN:=/etc/openvpn}"
 : "${EASYRSA_PKI:=${OPENVPN}/pki}"
+: "${EASYRSA_VARS_FILE:=${OPENVPN}/vars}"
 : "${CLIENT_DIR:=${OPENVPN}/clients}"
 : "${PKI_LOCK_FILE:=${OPENVPN}/.pki-write.lock}"
 : "${PKI_LOCK_TIMEOUT:=30}"
@@ -12,7 +13,22 @@
 : "${CERT_WARN_DAYS:=30}"
 : "${BACKUP_DIR:=${OPENVPN}/backups}"
 
-export OPENVPN EASYRSA_PKI
+export OPENVPN EASYRSA_PKI EASYRSA_VARS_FILE
+
+# Easy-RSA 3.1+ hard-fails ("Missing vars file") when EASYRSA_VARS_FILE is
+# exported but nothing exists at that path. ovpn_genconfig already guards
+# this for fresh PKI initialization, but every pre-existing production PKI
+# (issued years before this variable existed -- confirmed live on the
+# us-east-2/Ohio server-cert renewal on 2026-07-13) never had one and never
+# will unless something creates it. Every maintenance script sources this
+# library before touching easyrsa, so the guard belongs here once, not
+# duplicated per-script -- this is what makes ovpn_renew_server,
+# ovpn_renew_user, and the automatic client-renewal loop in ovpn_run all
+# work against PKI data that predates this whole rebuild. An empty file
+# satisfies the existence check; nothing here relies on vars-file content.
+if [ -n "$EASYRSA_VARS_FILE" ] && [ ! -f "$EASYRSA_VARS_FILE" ]; then
+    : > "$EASYRSA_VARS_FILE" 2>/dev/null || true
+fi
 
 log() {
     printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"

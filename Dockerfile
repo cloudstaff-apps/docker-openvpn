@@ -96,6 +96,7 @@ ADD ./bin/ovpn_pki_lib /usr/local/lib/ovpn_pki_lib
 RUN chmod a+x /usr/local/bin/* && \
     chmod 0644 /usr/local/lib/ovpn_pki_lib && \
     rm -f /usr/local/bin/ovpn_pki_lib && \
+    bash -n /usr/local/lib/ovpn_pki_lib && \
     bash -n /usr/local/bin/ovpn_run && \
     bash -n /usr/local/bin/ovpn_genconfig && \
     bash -n /usr/local/bin/ovpn_initpki && \
