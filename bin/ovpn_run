@@ -302,6 +302,20 @@ auto_renew_expired_client() {
     fi
 
     log "Auto-renewal succeeded for $username: serial $old_serial -> $new_serial"
+
+    # `easyrsa renew` stashes the superseded cert at pki/renewed/issued/$username.crt
+    # and refuses any FUTURE renew for this identity until that backup is retired.
+    # Left alone, this auto-renewal path would work exactly once per user and then
+    # permanently fail on their next renewal (whenever AUTO_RENEW_DAYS next elapses).
+    if ! easyrsa --batch revoke-renewed "$username"; then
+        warn "Auto-renewal for $username produced a valid new certificate, but revoke-renewed failed to retire the superseded one. The NEXT renewal for $username will fail until this is fixed manually: easyrsa --batch revoke-renewed '$username' && easyrsa --batch gen-crl"
+        return 0
+    fi
+
+    easyrsa --batch gen-crl
+    cp -f "$EASYRSA_PKI/crl.pem" "$OPENVPN/crl.pem"
+    chmod 644 "$OPENVPN/crl.pem"
+    log "Retired superseded certificate for $username via revoke-renewed; CRL regenerated"
     return 0
 }
 

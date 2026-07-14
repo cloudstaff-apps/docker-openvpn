@@ -101,9 +101,22 @@ for USERNAME in "${USERS[@]}"; do
 
     log "Renewed client certificate for '$USERNAME':"
     print_cert_summary "$CERT"
+
+    # `easyrsa renew` stashes the superseded cert at pki/renewed/issued/$USERNAME.crt
+    # and refuses to renew this identity again until that backup is retired. Retire
+    # it now so the NEXT renewal (auto or manual) for this user doesn't hit
+    # "Cannot renew this certificate, a conflicting file exists".
+    easyrsa --batch revoke-renewed "$USERNAME" \
+        || die "Renewed client certificate for $USERNAME is valid, but revoke-renewed failed to retire the superseded one. Fix manually before renewing $USERNAME again: easyrsa --batch revoke-renewed '$USERNAME'"
+
     log "Client certificate renewal completed: $USERNAME"
 done
 
+easyrsa --batch gen-crl
+cp -f "$EASYRSA_PKI/crl.pem" "$OPENVPN/crl.pem"
+chmod 644 "$OPENVPN/crl.pem"
+
 log "All requested client certificates were renewed"
+log "Retired all superseded certificates via revoke-renewed; CRL regenerated"
 log "Next action: run ovpn_update_profile for the same users and have them re-import the new profiles"
 log "Do not run ovpn_otp_user; OTP/MFA enrollment is unchanged"
