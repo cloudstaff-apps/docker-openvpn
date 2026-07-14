@@ -6,7 +6,7 @@ services:
       dockerfile: Dockerfile
     cap_add:
      - NET_ADMIN
-    image: cloudstaff/docker-openvpn:latest
+    image: cloudstaff/docker-openvpn:2.5.4
     environment:
       NAME: external-openvpn-perth
       DOMAIN_NAME: vpn-perth.shared.cloud.cloudstaff.com

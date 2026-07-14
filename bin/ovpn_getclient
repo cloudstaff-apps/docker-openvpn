@@ -32,35 +32,24 @@ fi
 get_client_config() {
     mode="$1"
 
-    # Force the client to dial the address family it actually got issued
-    # for, instead of the bare "udp"/"tcp" this used to emit. Bare udp/tcp
-    # lets the client's own OS resolver pick either family -- and on
-    # networks that run DNS64/NAT64 (confirmed 2026-07-14: a client's
-    # resolver handed back a synthetic AAAA for vpn-nia/vpn-ohi that
-    # decodes byte-for-byte back to their real A records -- e.g. TPG
-    # Telecom), the client tries the carrier-synthesized IPv6 address,
-    # macOS prefers it, and the whole OpenVPN tunnel ends up running
-    # through a carrier-grade NAT64 gateway instead of straight to our
-    # real IPv4 endpoint. That's what broke nitinb's connection on
-    # us-east-1 and us-east-2. udp4/tcp4 make OpenVPN's own resolver
-    # refuse anything but a real A record, bypassing DNS64 synthesis
-    # entirely regardless of what the client's local resolver tries to
-    # hand it. Existing udp6/tcp6 deployments are left exactly as they
-    # were -- this only changes the plain udp/tcp case, which is what
-    # every region in this fleet actually uses.
-    client_proto="$OVPN_PROTO"
-    case "$OVPN_PROTO" in
-        udp) client_proto="udp4" ;;
-        tcp) client_proto="tcp4" ;;
-    esac
-
+    # REVERTED 2026-07-14: forcing udp4/tcp4 here (see git history) broke
+    # connectivity for clients on genuinely IPv6-only networks running
+    # 464XLAT/CLAT (Apple's on-device NAT64 -- gateway 192.0.0.1, confirmed
+    # live against nitinb's own connection). Tricking Tunnelblick into
+    # thinking the tunnel is plain IPv4 makes it disable local IPv6, which
+    # on a CLAT network severs the interface's only real connectivity
+    # entirely -- worse than the original DNS64-synthesized-AAAA flakiness
+    # this was meant to fix. Back to bare udp/tcp, matching every profile
+    # this fleet has ever issued, until a fix that doesn't fight CLAT
+    # networks is designed (see the 2.5.3 tag/commit message and this
+    # revert's commit message for the full incident detail).
     echo "
 client
 nobind
 dev $OVPN_DEVICE
 remote-cert-tls server
 
-remote $OVPN_CN $OVPN_PORT $client_proto"
+remote $OVPN_CN $OVPN_PORT $OVPN_PROTO"
     if [ "$OVPN_PROTO" == "udp6" ]; then
         echo "remote $OVPN_CN $OVPN_PORT udp"
     fi

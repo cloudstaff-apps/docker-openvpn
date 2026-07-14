@@ -1,56 +1,61 @@
 # Original credit: https://github.com/jpetazzo/dockvpn
 
-# alpine:3.9 (EOL since ~2021, hasn't received security patches in years --
-# confirmed 2026-07-13) is why the container was still running OpenVPN
-# 2.4.6, several major versions and CVEs (e.g. CVE-2020-15078,
-# CVE-2022-0547 -- both relevant to the deferred PAM auth this image uses)
-# behind current. 3.24 is Alpine's newest supported branch (security
-# support into mid-2028 as of this writing) and carries OpenVPN 2.7.x.
-FROM alpine:3.24
+# REVERTED 2026-07-14: back to the exact base (alpine:3.9, its packaged
+# OpenVPN 2.4.6) that was proven working before tonight's rebuild. Every
+# attempt to move OpenVPN forward tonight -- the packaged 2.7.5, then a
+# source-built 2.5.10 with dyn-tls-crypt/cc-exit/tls-ekm stripped out --
+# still broke real traffic on the affected client network. A verb-4 server
+# log during that last test showed zero data-channel activity ever reaching
+# the OpenVPN process after the initial handshake, which points at something
+# in the network path itself, not the OpenVPN version or its config -- so
+# the version swap was abandoned rather than pursued further tonight.
+#
+# This keeps that known-good base and carries forward only what this
+# session's script/PKI work actually depends on: a working Easy-RSA
+# (3.0.5-r0, previously pinned here, has no `renew` action at all -- see
+# the version history above this comment) and the six ovpn_* maintenance
+# scripts plus the locking/renewal support they need.
+#
+# Be clear about the tradeoff, not just the revert: alpine:3.9 has been EOL
+# since ~2021 and OpenVPN 2.4.6 is years behind on patches (CVE-2020-15078,
+# CVE-2022-0547 both apply). That EOL exposure is being deliberately
+# reintroduced to get back to a connectivity baseline that's proven to work
+# for real users tonight -- not a free fix, a real tradeoff made under time
+# pressure, and worth revisiting once the actual network-path cause is
+# found.
+FROM alpine:3.9
 
 LABEL maintainer="Kyle Manna <kyle@kylemanna.com>"
 
-# Easy-RSA is intentionally NOT installed from the Alpine package repo
-# (previously easy-rsa=3.0.5-r0). That version has no `renew` action at
-# all -- confirmed the hard way in production on 2026-07-13 -- so pinning
-# and verifying a specific upstream release is required, not optional.
-# util-linux is required for a real `flock` binary: Alpine/BusyBox's
-# built-in `flock` applet doesn't support `-w` (wait-with-timeout), which
-# the PKI write-lock in ovpn_pki_lib depends on. py3-pip is separate from
-# python3 on modern Alpine (no longer bundled); --break-system-packages is
-# required because current pip refuses a bare system-wide install
-# (PEP 668) otherwise -- there is no native Alpine package for
-# influxdb-client (client-disconnect.py imports it directly), so pip is
-# still required for that one dependency.
-RUN apk add --update openvpn iptables bash openvpn-auth-pam google-authenticator python3 py3-pip \
-        ca-certificates curl openssl tar util-linux && \
-    pip3 install --no-cache-dir --break-system-packages influxdb-client && \
+# util-linux added (wasn't in the original 3.9 image): the current
+# ovpn_pki_lib's write-lock uses `flock -w` (wait-with-timeout), which
+# Alpine/BusyBox's built-in `flock` applet doesn't support -- confirmed
+# necessary for the maintenance scripts added below, not part of the
+# original working image.
+RUN apk add --update openvpn iptables bash openvpn-auth-pam google-authenticator python3 util-linux openssl && \
+    pip3 install influxdb-client && \
     rm -rf /tmp/* /var/tmp/* /var/cache/apk/* /var/cache/distfiles/*
 
 # pamtester (used only as an operator diagnostic per docs/otp.md, not by
 # any runtime script) has never had a stable-branch build on Alpine --
-# edge/testing is the only place it has ever existed, on 3.9 or 3.24 alike.
+# edge/testing is the only place it has ever existed, on 3.9 or otherwise.
 RUN apk add \
   --no-cache \
   --allow-untrusted \
   --repository http://dl-cdn.alpinelinux.org/alpine/edge/testing \
   pamtester
 
-# AWS CLI v2, via Alpine's own community package -- a native musl/Python3
-# build, not AWS's official installer (which is glibc-only and does not
-# run on Alpine at all). This replaces the old Python 2 + `pip install
-# awscli==1.16.169` block entirely: Python 2 has been unsupported since
-# Jan 2020 and isn't packaged on modern Alpine in the first place, and
-# nothing else in this image (grep confirmed) depends on the extra
-# groff/less/make/jq/gettext-dev/wget/g++/zip/git tools that block used to
-# pull in as a side effect -- those existed only to support the old pip
-# install, not any script here.
-RUN apk --no-cache add aws-cli && \
+ENV AWSCLI_VERSION=1.16.169
+RUN apk --no-cache update && \
+    apk --no-cache add python py-pip py-setuptools ca-certificates groff less bash make jq gettext-dev curl wget g++ zip git && \
+    pip --no-cache-dir install awscli==$AWSCLI_VERSION && \
+    update-ca-certificates && \
     rm -rf /var/cache/apk/*
-# aws-cli v2 auto-invokes a pager for TTY-attached output; disable it so
-# an interactive `docker exec ... raw ...` debugging session never hangs.
-ENV AWS_PAGER=""
 
+# Easy-RSA is intentionally NOT installed from the Alpine package repo
+# (previously easy-rsa=3.0.5-r0). That version has no `renew` action at
+# all -- confirmed the hard way in production this session -- so pinning
+# and verifying a specific upstream release is required, not optional.
 ARG EASYRSA_VERSION=3.2.6
 ARG EASYRSA_SHA256=c2572990ce91112eef8d1b8e4a3b58790da95b68501785c621f69121dfbd22d7
 
