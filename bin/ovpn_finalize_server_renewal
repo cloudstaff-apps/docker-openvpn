@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+# shellcheck source=/usr/local/lib/ovpn_pki_lib
+source "${OVPN_PKI_LIB:-/usr/local/lib/ovpn_pki_lib}"
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  ovpn_finalize_server_renewal [SERVER_NAME]
+
+Defaults:
+  SERVER_NAME = $DOMAIN_NAME
+
+Run this ONLY after a server certificate renewal (ovpn_renew_server) has
+been deployed via a full ECS task/container restart, and you have
+confirmed the restarted server is healthy and accepting real client
+connections on the NEW certificate.
+
+This command:
+  - confirms there is a pending renewed-but-not-finalized server
+    certificate for SERVER_NAME (refuses if there isn't one);
+  - acquires the shared PKI write lock;
+  - creates one backup before making changes;
+  - revokes the superseded (pre-renewal) server certificate via
+    'easyrsa revoke-renewed', clearing pki/renewed/* so the NEXT
+    renewal for this identity doesn't fail with "conflicting file
+    exists";
+  - regenerates the CRL and redistributes it to $OPENVPN/crl.pem.
+
+Do not run this before confirming the restart succeeded -- once run,
+the pre-renewal certificate is revoked and cannot be un-revoked.
+USAGE
+}
+
+SERVER_NAME=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --*)
+            die "Unknown option: $1"
+            ;;
+        *)
+            [ -z "$SERVER_NAME" ] || die "Server name supplied more than once"
+            SERVER_NAME="$1"
+            shift
+            ;;
+    esac
+done
+
+# An explicit argument wins; DOMAIN_NAME (always set in the container) is the default.
+SERVER_NAME="${SERVER_NAME:-${DOMAIN_NAME:-}}"
+[ -n "$SERVER_NAME" ] || die "SERVER_NAME is required; set DOMAIN_NAME or pass it as an argument"
+validate_identity "$SERVER_NAME"
+require_command easyrsa
+require_command openssl
+ensure_pki_exists
+
+CERT="$EASYRSA_PKI/issued/$SERVER_NAME.crt"
+PENDING="$EASYRSA_PKI/renewed/issued/$SERVER_NAME.crt"
+
+require_file "$CERT"
+[ -f "$PENDING" ] || die "No pending renewal found for $SERVER_NAME at $PENDING -- nothing to finalize. (Wrong SERVER_NAME, or was this already finalized?)"
+
+cert_is_current "$CERT" || die "The ACTIVE certificate for $SERVER_NAME is not currently valid. Refusing to finalize -- investigate before revoking anything."
+
+log "Active server certificate for '$SERVER_NAME' (about to be confirmed as permanent):"
+print_cert_summary "$CERT"
+log "Pending (superseded) certificate about to be revoked:"
+print_cert_summary "$PENDING"
+
+acquire_pki_lock
+trap cleanup_on_exit EXIT
+backup_openvpn_state "finalize-server-renewal-${SERVER_NAME}"
+
+log "Revoking superseded server certificate for '$SERVER_NAME'"
+easyrsa --batch revoke-renewed "$SERVER_NAME"
+
+log "Regenerating CRL"
+easyrsa --batch gen-crl
+cp -f "$EASYRSA_PKI/crl.pem" "$OPENVPN/crl.pem"
+chmod 644 "$OPENVPN/crl.pem"
+
+log "Server certificate renewal finalized for '$SERVER_NAME'; CRL regenerated and redistributed"
+log "The next renewal for '$SERVER_NAME' will no longer hit 'conflicting file exists'"
