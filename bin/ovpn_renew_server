@@ -27,7 +27,7 @@ USAGE
 }
 
 DAYS="$CERT_DAYS"
-SERVER_NAME="${DOMAIN_NAME:-}"
+SERVER_NAME=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -51,6 +51,8 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+# An explicit argument wins; DOMAIN_NAME (always set in the container) is the default.
+SERVER_NAME="${SERVER_NAME:-${DOMAIN_NAME:-}}"
 [ -n "$SERVER_NAME" ] || die "SERVER_NAME is required; set DOMAIN_NAME or pass it as an argument"
 [[ "$DAYS" =~ ^[0-9]+$ ]] && [ "$DAYS" -gt 0 ] || die "Invalid certificate lifetime: $DAYS"
 

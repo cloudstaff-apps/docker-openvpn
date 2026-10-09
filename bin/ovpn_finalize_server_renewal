@@ -34,7 +34,7 @@ the pre-renewal certificate is revoked and cannot be un-revoked.
 USAGE
 }
 
-SERVER_NAME="${DOMAIN_NAME:-}"
+SERVER_NAME=""
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -53,6 +53,8 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+# An explicit argument wins; DOMAIN_NAME (always set in the container) is the default.
+SERVER_NAME="${SERVER_NAME:-${DOMAIN_NAME:-}}"
 [ -n "$SERVER_NAME" ] || die "SERVER_NAME is required; set DOMAIN_NAME or pass it as an argument"
 validate_identity "$SERVER_NAME"
 require_command easyrsa
